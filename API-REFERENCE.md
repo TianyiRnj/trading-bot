@@ -951,7 +951,7 @@ curl "https://musashi-api.vercel.app/api/health"
 
 ## Notes for SDK Users
 
-The TypeScript SDK lives at [src/sdk/musashi-agent.ts](/Users/ty/Documents/Musashi/Musashi/src/sdk/musashi-agent.ts).
+The TypeScript SDK lives at [src/sdk/musashi-agent.ts](../Musashi/src/sdk/musashi-agent.ts).
 
 Useful methods:
 - `analyzeText(text, options)`
@@ -970,4 +970,4 @@ Useful methods:
 
 This README documents the public prediction-market REST API under `api/`.
 
-The repository also contains a separate local backend server documented in [BACKEND_API.md](/Users/ty/Documents/Musashi/Musashi/BACKEND_API.md). That server is for Supabase-backed application data and is not part of the public Musashi market-intelligence REST surface documented above.
+The repository also contains a separate local backend server documented in [BACKEND_API.md](../Musashi/BACKEND_API.md). That server is for Supabase-backed application data and is not part of the public Musashi market-intelligence REST surface documented above.
