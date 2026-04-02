@@ -469,6 +469,16 @@ class MusashiClient:
         response.raise_for_status()
         return response.json()
 
+    def get_arbitrage(self, min_spread: float = 0.05, limit: int = 20) -> dict[str, Any]:
+        """Get arbitrage opportunities between Polymarket and Kalshi"""
+        response = self.session.get(
+            f"{self.base_url}/api/markets/arbitrage",
+            params={"minSpread": min_spread, "limit": limit},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
 
 class PolymarketPublicClient:
     def __init__(self) -> None:
@@ -889,6 +899,17 @@ class Bot:
         )
         self.startup_geo_profile: dict[str, str] | None = None
 
+        # Initialize Pure Arbitrage strategy
+        from arbitrage_strategy import ArbitrageStrategy
+        self.arbitrage_strategy = ArbitrageStrategy(
+            gamma_client=self.gamma,
+            musashi_client=self.musashi,
+            trader=self.trader,
+            positions=self.positions,
+            save_state_callback=self.save_state
+        )
+        self.arbitrage_thread = None
+
     def current_exposure(self) -> float:
         return sum(float(position.get("size_usd", 0)) for position in self.positions.values())
 
@@ -1078,7 +1099,7 @@ class Bot:
 
         if not action or not matches or not event_id:
             return None
-        if urgency not in {"high", "critical"}:
+        if urgency not in {"medium", "high", "critical"}:
             return None
         if action.get("direction") not in {"YES", "NO"}:
             return None
@@ -1659,6 +1680,15 @@ class Bot:
             )
             self.start_realtime_streams()
             self.reconcile_startup_state()
+
+            # Start Pure Arbitrage strategy in background thread
+            logger.info("Starting Pure Arbitrage strategy (Polymarket <-> Kalshi)")
+            self.arbitrage_thread = threading.Thread(
+                target=self.arbitrage_strategy.run_scanner,
+                name="arbitrage-scanner",
+                daemon=True
+            )
+            self.arbitrage_thread.start()
 
             while True:
                 loop_started_at = time.time()
