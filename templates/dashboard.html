@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arbitrage Bot Dashboard</title>
+    <meta http-equiv="refresh" content="2">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0a0e27;
+            color: #00ff41;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            color: #00ff41;
+            text-shadow: 0 0 10px #00ff41;
+            letter-spacing: 3px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #00aaff;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+            letter-spacing: 2px;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .metric-card {
+            background: #0f1419;
+            border: 2px solid #1a4d2e;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .metric-label {
+            color: #888;
+            font-size: 0.9em;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .metric-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #00ff41;
+        }
+
+        .metric-value.profit {
+            color: #00ff41;
+        }
+
+        .metric-value.neutral {
+            color: #00aaff;
+        }
+
+        .section {
+            background: #0f1419;
+            border: 2px solid #1a4d2e;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .section-title {
+            font-size: 1.5em;
+            margin-bottom: 15px;
+            color: #00ff41;
+            border-bottom: 1px solid #1a4d2e;
+            padding-bottom: 10px;
+        }
+
+        .strategy-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 15px;
+            color: #00aaff;
+        }
+
+        .strategy-item {
+            padding: 10px;
+            background: #1a1f2e;
+            border-radius: 4px;
+            border-left: 3px solid #00ff41;
+        }
+
+        .strategy-item strong {
+            color: #00ff41;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+
+        th {
+            background: #1a1f2e;
+            color: #00ff41;
+            padding: 12px;
+            text-align: left;
+            font-weight: bold;
+            border-bottom: 2px solid #1a4d2e;
+        }
+
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #1a4d2e;
+            color: #00aaff;
+        }
+
+        tr:hover {
+            background: #1a1f2e;
+        }
+
+        .platform-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.85em;
+            font-weight: bold;
+        }
+
+        .platform-poly {
+            background: #8247e5;
+            color: white;
+        }
+
+        .platform-kalshi {
+            background: #ff6b6b;
+            color: white;
+        }
+
+        .profit-positive {
+            color: #00ff41;
+            font-weight: bold;
+        }
+
+        .spread-badge {
+            background: #ffd700;
+            color: #0a0e27;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+
+        .price {
+            font-family: 'Courier New', monospace;
+            font-weight: bold;
+        }
+
+        .arrow {
+            color: #00ff41;
+            font-size: 1.2em;
+        }
+
+        .no-data {
+            text-align: center;
+            color: #666;
+            padding: 30px;
+            font-style: italic;
+        }
+
+        .timestamp {
+            color: #666;
+            font-size: 0.9em;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #00ff41;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .header-status {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+        }
+
+        .live-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #00ff41;
+            font-size: 1.1em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header-status">
+            <div></div>
+            <h1>⚡ ARBITRAGE BOT DASHBOARD ⚡</h1>
+            <div class="live-indicator">
+                <span class="status-indicator"></span>
+                LIVE
+            </div>
+        </div>
+        <div class="subtitle">PURE ARBITRAGE: POLYMARKET ↔ KALSHI | RISK-FREE PROFIT</div>
+
+        <!-- Performance Metrics -->
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-label">Total Profit</div>
+                <div class="metric-value profit">${{ "%.2f"|format(total_profit) }}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Arbitrage Trades</div>
+                <div class="metric-value neutral">{{ arb_count }}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Win Rate</div>
+                <div class="metric-value profit">{{ "%.1f"|format(win_rate) }}%</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Avg Spread</div>
+                <div class="metric-value neutral">{{ "%.2f"|format(avg_spread) }}%</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Bankroll</div>
+                <div class="metric-value neutral">${{ "%.2f"|format(bankroll) }}</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Available</div>
+                <div class="metric-value neutral">${{ "%.2f"|format(available) }}</div>
+            </div>
+        </div>
+
+        <!-- Strategy Config -->
+        <div class="section">
+            <div class="section-title">📊 Strategy Configuration</div>
+            <div class="strategy-info">
+                <div class="strategy-item">
+                    <strong>Strategy:</strong> Pure Cross-Platform Arbitrage
+                </div>
+                <div class="strategy-item">
+                    <strong>Platforms:</strong> Polymarket ↔ Kalshi
+                </div>
+                <div class="strategy-item">
+                    <strong>Min Spread:</strong> 5% to execute
+                </div>
+                <div class="strategy-item">
+                    <strong>Position Size:</strong> $10 per leg ($20 total exposure)
+                </div>
+                <div class="strategy-item">
+                    <strong>Scan Interval:</strong> 5 seconds
+                </div>
+                <div class="strategy-item">
+                    <strong>Mode:</strong> Paper Trading (Fake Money, Real Data)
+                </div>
+            </div>
+        </div>
+
+        <!-- Recent Arbitrage Trades -->
+        <div class="section">
+            <div class="section-title">💰 Recent Arbitrage Trades</div>
+            {% if recent_trades %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Market</th>
+                        <th>Buy Platform</th>
+                        <th>Buy Price</th>
+                        <th></th>
+                        <th>Sell Platform</th>
+                        <th>Sell Price</th>
+                        <th>Spread</th>
+                        <th>Profit</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for trade in recent_trades %}
+                    <tr>
+                        <td class="timestamp">{{ trade.time }}</td>
+                        <td>{{ trade.title[:50] }}</td>
+                        <td>
+                            <span class="platform-badge {{ 'platform-poly' if trade.buy_platform == 'polymarket' else 'platform-kalshi' }}">
+                                {{ trade.buy_platform.upper() }}
+                            </span>
+                        </td>
+                        <td class="price">{{ "%.1f"|format(trade.buy_price * 100) }}¢</td>
+                        <td class="arrow">→</td>
+                        <td>
+                            <span class="platform-badge {{ 'platform-poly' if trade.sell_platform == 'polymarket' else 'platform-kalshi' }}">
+                                {{ trade.sell_platform.upper() }}
+                            </span>
+                        </td>
+                        <td class="price">{{ "%.1f"|format(trade.sell_price * 100) }}¢</td>
+                        <td><span class="spread-badge">{{ "%.1f"|format(trade.spread_percent * 100) }}%</span></td>
+                        <td class="profit-positive">+${{ "%.2f"|format(trade.profit) }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="no-data">No arbitrage trades executed yet. Scanning for opportunities...</div>
+            {% endif %}
+        </div>
+
+        <!-- Bot Logs -->
+        <div class="section">
+            <div class="section-title">📜 Bot Logs (Last 20 lines)</div>
+            <div style="background: #000; padding: 15px; border-radius: 4px; font-size: 0.9em; overflow-x: auto;">
+                {% for log in logs %}
+                <div style="margin-bottom: 5px; color: #00ff41;">{{ log }}</div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+</body>
+</html>
