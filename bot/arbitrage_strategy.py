@@ -99,6 +99,8 @@ class ArbitrageStrategy:
 
             opportunities: list[ArbitrageOpportunity] = []
 
+            logger.info("─" * 80)
+            logger.info("MATCHED PAIRS FROM MUSASHI (%d total):", len(arbs))
             for arb in arbs:
                 try:
                     poly_market = arb.get("polymarket", {})
@@ -123,17 +125,31 @@ class ArbitrageStrategy:
                     spread = abs(poly_yes_price - kalshi_yes_price)
                     spread_percent = spread / min(poly_yes_price, kalshi_yes_price)
 
-                    if spread_percent < MIN_SPREAD_PERCENT:
-                        continue
-
                     poly_volume = float(poly_market.get("volume24h", poly_market.get("volume", 0)))
                     kalshi_volume = float(kalshi_market.get("volume24h", kalshi_market.get("volume", 0)))
 
+                    poly_title = poly_market.get("title", poly_market.get("question", "Unknown"))
+                    kalshi_title = kalshi_market.get("title", kalshi_id)
+
+                    # Determine why this pair does or doesn't qualify
+                    if spread_percent < MIN_SPREAD_PERCENT:
+                        verdict = f"NOT ARBITRAGE — spread {spread_percent*100:.1f}% < {MIN_SPREAD_PERCENT*100:.0f}% min"
+                    elif poly_volume < MIN_VOLUME_USD or kalshi_volume < MIN_VOLUME_USD:
+                        verdict = f"NOT ARBITRAGE — low volume (poly=${poly_volume:,.0f}, kalshi=${kalshi_volume:,.0f})"
+                    else:
+                        verdict = f"ARBITRAGE — spread {spread_percent*100:.1f}%, buy {('POLY' if poly_yes_price < kalshi_yes_price else 'KALSHI')}"
+
+                    logger.info(
+                        "  [%s]  poly=%.2f¢  kalshi=%.2f¢",
+                        verdict, poly_yes_price * 100, kalshi_yes_price * 100,
+                    )
+                    logger.info("    POLY  : %s", poly_title[:72])
+                    logger.info("    KALSHI: %s", kalshi_title[:72])
+
+                    if spread_percent < MIN_SPREAD_PERCENT:
+                        continue
+
                     if poly_volume < MIN_VOLUME_USD or kalshi_volume < MIN_VOLUME_USD:
-                        logger.debug(
-                            "Low volume skipped: poly=$%.0f kalshi=$%.0f",
-                            poly_volume, kalshi_volume,
-                        )
                         continue
 
                     if poly_yes_price < kalshi_yes_price:
