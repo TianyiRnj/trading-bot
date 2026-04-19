@@ -194,7 +194,7 @@ class ArbitrageStrategy:
                 logger.info("       KALSHI: (id %s)", op.kalshi_market_id)
             logger.info("─" * 80)
 
-            self._log_pairs_csv(opportunities)
+            self._log_pairs_csv(arbs)
             return opportunities
 
         except Exception as exc:
@@ -395,8 +395,8 @@ class ArbitrageStrategy:
     # CSV logging
     # ------------------------------------------------------------------
 
-    def _log_pairs_csv(self, opportunities: list["ArbitrageOpportunity"]) -> None:
-        """Append matched pairs to data/arbitrage_pairs.csv for documentation."""
+    def _log_pairs_csv(self, arbs: list[dict]) -> None:
+        """Append ALL matched pairs (with verdict) to data/arbitrage_pairs.csv."""
         from main import DATA_DIR  # noqa: PLC0415
         csv_path = Path(DATA_DIR) / "arbitrage_pairs.csv"
         write_header = not csv_path.exists()
@@ -405,22 +405,39 @@ class ArbitrageStrategy:
             writer = csv.writer(f)
             if write_header:
                 writer.writerow([
-                    "timestamp", "poly_title", "kalshi_id",
+                    "timestamp", "poly_title", "kalshi_title",
                     "poly_price_cents", "kalshi_price_cents",
-                    "spread_pct", "buy_platform",
-                    "poly_vol_24h", "kalshi_vol_24h",
+                    "spread_pct", "poly_vol_24h", "kalshi_vol_24h", "verdict",
                 ])
-            for op in opportunities:
+            for arb in arbs:
+                poly = arb.get("polymarket", {})
+                kalshi = arb.get("kalshi", {})
+                poly_price = float(poly.get("yesPrice", 0))
+                kalshi_price = float(kalshi.get("yesPrice", 0))
+                if poly_price == 0 or kalshi_price == 0:
+                    continue
+                spread = abs(poly_price - kalshi_price)
+                spread_pct = spread / min(poly_price, kalshi_price) * 100
+                poly_vol = float(poly.get("volume24h", 0))
+                kalshi_vol = float(kalshi.get("volume24h", 0))
+
+                if spread_pct < MIN_SPREAD_PERCENT * 100:
+                    verdict = f"not arbitrage - spread {spread_pct:.1f}% < {MIN_SPREAD_PERCENT*100:.0f}% min"
+                elif poly_vol < MIN_VOLUME_USD or kalshi_vol < MIN_VOLUME_USD:
+                    verdict = f"not arbitrage - low volume (poly=${poly_vol:,.0f} kalshi=${kalshi_vol:,.0f})"
+                else:
+                    verdict = "ARBITRAGE"
+
                 writer.writerow([
                     ts,
-                    op.title,
-                    op.kalshi_market_id,
-                    round(op.poly_price * 100, 2),
-                    round(op.kalshi_price * 100, 2),
-                    round(op.spread_percent * 100, 2),
-                    op.buy_platform,
-                    round(op.poly_volume, 2),
-                    round(op.kalshi_volume, 2),
+                    poly.get("title", ""),
+                    kalshi.get("title", ""),
+                    round(poly_price * 100, 2),
+                    round(kalshi_price * 100, 2),
+                    round(spread_pct, 2),
+                    round(poly_vol, 2),
+                    round(kalshi_vol, 2),
+                    verdict,
                 ])
         logger.info("Pairs logged → %s", csv_path)
 
