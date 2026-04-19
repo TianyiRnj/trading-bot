@@ -758,6 +758,10 @@ class PaperTrader:
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         return {"success": True, "canceled": [order_id]}
 
+    def check_entry_liquidity(self, token_id: str, size_usd: float) -> bool:
+        # Paper mode has no real order book — always allow entry.
+        return True
+
 
 class LiveTrader:
     def __init__(self) -> None:
@@ -796,6 +800,26 @@ class LiveTrader:
         except Exception as exc:
             logger.warning("Failed to fetch SELL quote for %s: %s", token_id, exc)
         return clamp_price(fallback_probability)
+
+    def check_entry_liquidity(self, token_id: str, size_usd: float) -> bool:
+        # get_price returns the best ask (lowest offer) or None when no sellers
+        # exist in the order book. A None result means the market is too thin
+        # to absorb even a single FOK order, so we skip rather than moving
+        # the price 5-10% on entry.
+        try:
+            quoted = self._client.get_price(token_id, side="BUY")
+            if quoted is None:
+                logger.warning(
+                    "[liquidity] No BUY price for token %s — order book empty, skipping entry",
+                    token_id,
+                )
+                return False
+            return True
+        except Exception as exc:
+            # Fail open: if the price check itself errors, allow the entry
+            # rather than silently blocking all live trades.
+            logger.warning("[liquidity] Could not fetch BUY price for %s: %s — allowing entry", token_id, exc)
+            return True
 
     def place_market_buy(self, token_id: str, amount_usd: float, meta: dict[str, Any]) -> dict[str, Any]:
         from py_clob_client.clob_types import MarketOrderArgs
@@ -1226,6 +1250,11 @@ class Bot:
         gamma_market = self.gamma.resolve_market(market)
         token_id = pick_token_id(gamma_market, decision.side)
         condition_id = extract_condition_id(gamma_market) or extract_condition_id(market)
+
+        if not self.trader.check_entry_liquidity(token_id, size_usd):
+            logger.warning("Skipped %s — insufficient order book liquidity for a $%.2f entry", market_id, size_usd)
+            return
+
         response = self.trader.place_market_buy(
             token_id=token_id,
             amount_usd=size_usd,
