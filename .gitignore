@@ -1,16 +1,29 @@
-.venv/
-__pycache__/
-*.py[cod]
+# Environment and secrets
 .env
 .env.*
 !.env.example
-.DS_Store
+
+# Python environments and bytecode
+.venv/
+__pycache__/
+*.py[cod]
+
+# Test, coverage, and tooling caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
+
+# Runtime state
 bot/data/
 bot/logs/
+
+# Local assistant files
+.claude/
 agents.md
 claude.md
+
+# OS files
+.DS_Store
