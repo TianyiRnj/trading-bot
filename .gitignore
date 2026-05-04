@@ -1,5 +1,14 @@
 .venv/
 __pycache__/
+*.py[cod]
 .env
+.env.*
+!.env.example
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 bot/data/
 bot/logs/
