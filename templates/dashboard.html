@@ -196,13 +196,7 @@
             width: 10px;
             height: 10px;
             border-radius: 50%;
-            background: #00ff41;
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            background: #00aaff;
         }
 
         .header-status {
@@ -216,7 +210,7 @@
             display: flex;
             align-items: center;
             gap: 10px;
-            color: #00ff41;
+            color: #00aaff;
             font-size: 1.1em;
         }
     </style>
@@ -228,10 +222,10 @@
             <h1>⚡ ARBITRAGE BOT DASHBOARD ⚡</h1>
             <div class="live-indicator">
                 <span class="status-indicator"></span>
-                LIVE
+                SIMULATION
             </div>
         </div>
-        <div class="subtitle">PURE ARBITRAGE: POLYMARKET ↔ KALSHI | RISK-FREE PROFIT</div>
+        <div class="subtitle">POLYMARKET ↔ KALSHI ARBITRAGE | SIMULATION MODE (PAPER TRADES ONLY)</div>
 
         <!-- Performance Metrics -->
         <div class="metrics-grid">
@@ -252,11 +246,11 @@
                 <div class="metric-value neutral">{{ "%.2f"|format(avg_spread) }}%</div>
             </div>
             <div class="metric-card">
-                <div class="metric-label">Bankroll</div>
+                <div class="metric-label">Paper Bankroll</div>
                 <div class="metric-value neutral">${{ "%.2f"|format(bankroll) }}</div>
             </div>
             <div class="metric-card">
-                <div class="metric-label">Available</div>
+                <div class="metric-label">Available (Paper)</div>
                 <div class="metric-value neutral">${{ "%.2f"|format(available) }}</div>
             </div>
         </div>

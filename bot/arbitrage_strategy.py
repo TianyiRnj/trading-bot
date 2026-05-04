@@ -1,50 +1,108 @@
 """
-Pure Arbitrage Strategy - REAL MATH, GUARANTEED PROFIT
+Cross-platform arbitrage scanner (Polymarket <-> Kalshi) — SIMULATION ONLY.
 
-Strategy:
-1. Find markets on both Polymarket AND Kalshi
-2. Calculate price spread: abs(poly_price - kalshi_price)
-3. If spread > 5%, execute arbitrage:
-   - Buy on cheaper platform
-   - Sell on expensive platform
-4. Profit = spread × position_size (minus fees)
-
-This is risk-free profit - no prediction needed, just math.
+Finds markets where the YES price differs between platforms, logs the
+opportunity, and records simulated trade results. No live Kalshi order
+placement is implemented; all "executed" trades are paper entries only.
 """
-import time
+import json
 import logging
-from datetime import datetime, timezone
-from typing import Any, Optional
+import time
+from pathlib import Path
+from typing import Optional
 from dataclasses import dataclass
+
+try:
+    from utils import utc_now_iso                              # script: python bot/arbitrage_strategy.py
+except ImportError:
+    from bot.utils import utc_now_iso                          # package: import bot.arbitrage_strategy
 
 logger = logging.getLogger("arbitrage")
 
-# Arbitrage Parameters
-MIN_SPREAD_PERCENT = 0.05  # 5% minimum spread for arbitrage
-POSITION_SIZE_USD = 10.0  # $10 per leg (total $20 exposure)
-SCAN_INTERVAL_SECONDS = 5  # Check every 5 seconds for arb opportunities
-MIN_VOLUME_USD = 50000  # $50k minimum volume for liquidity
+# Arbitrage parameters
+MIN_SPREAD_PERCENT = 0.05   # 5% minimum spread to log an opportunity
+POSITION_SIZE_USD = 10.0    # $10 per leg (total $20 simulated exposure)
+SCAN_INTERVAL_SECONDS = 5   # seconds between API polls
+MIN_VOLUME_USD = 50000      # $50k minimum 24h volume for liquidity check
+
+_ARB_TRADES_FILE = Path(__file__).parent / "data" / "arbitrage_trades.jsonl"
+
 
 @dataclass
 class ArbitrageOpportunity:
-    """Represents a cross-platform arbitrage opportunity"""
+    """Represents a cross-platform arbitrage opportunity."""
     poly_market_id: str
     kalshi_market_id: str
     title: str
     poly_price: float
     kalshi_price: float
     spread_percent: float
-    buy_platform: str  # "polymarket" or "kalshi"
+    buy_platform: str   # "polymarket" or "kalshi"
     sell_platform: str
     profit_usd: float
     poly_volume: float
     kalshi_volume: float
 
 
+def _parse_opportunity(
+    arb: dict,
+    min_spread: float = MIN_SPREAD_PERCENT,
+    min_volume: float = MIN_VOLUME_USD,
+) -> Optional[ArbitrageOpportunity]:
+    """Parse one entry from ``data.opportunities`` into an ArbitrageOpportunity.
+
+    Returns None if required fields are absent, prices are zero, or the
+    spread / volume thresholds are not met.
+    """
+    poly_market = arb.get("polymarket", {})
+    kalshi_market = arb.get("kalshi", {})
+    if not poly_market or not kalshi_market:
+        return None
+
+    poly_id = str(poly_market.get("id", ""))
+    kalshi_id = str(kalshi_market.get("id", ""))
+    poly_price = float(poly_market.get("yesPrice", 0))
+    kalshi_price = float(kalshi_market.get("yesPrice", 0))
+
+    if not poly_id or not kalshi_id or poly_price == 0 or kalshi_price == 0:
+        return None
+
+    spread = abs(poly_price - kalshi_price)
+    spread_pct = spread / min(poly_price, kalshi_price)
+
+    if spread_pct < min_spread:
+        return None
+
+    poly_volume = float(poly_market.get("volume24h", 0))
+    kalshi_volume = float(kalshi_market.get("volume24h", 0))
+    if poly_volume < min_volume or kalshi_volume < min_volume:
+        return None
+
+    buy_platform = "polymarket" if poly_price < kalshi_price else "kalshi"
+    sell_platform = "kalshi" if buy_platform == "polymarket" else "polymarket"
+
+    return ArbitrageOpportunity(
+        poly_market_id=poly_id,
+        kalshi_market_id=kalshi_id,
+        title=poly_market.get("title", kalshi_market.get("title", "Unknown")),
+        poly_price=poly_price,
+        kalshi_price=kalshi_price,
+        spread_percent=spread_pct,
+        buy_platform=buy_platform,
+        sell_platform=sell_platform,
+        profit_usd=spread * POSITION_SIZE_USD,
+        poly_volume=poly_volume,
+        kalshi_volume=kalshi_volume,
+    )
+
+
 class ArbitrageStrategy:
     """
-    Pure arbitrage strategy between Polymarket and Kalshi
-    No predictions, no sentiment, just price spreads
+    Cross-platform arbitrage scanner — simulation only.
+
+    Polls the Musashi API for price spreads between Polymarket and Kalshi,
+    logs opportunities, and records simulated paper trades. No real orders
+    are placed on Kalshi.
     """
 
     def __init__(self, gamma_client, musashi_client, trader, positions, save_state_callback):
@@ -53,157 +111,94 @@ class ArbitrageStrategy:
         self.trader = trader
         self.positions = positions
         self.save_state = save_state_callback
-        self.executed_arbs = set()  # Track executed arbitrages
+        self.executed_arbs: set[str] = set()
         self.total_profit = 0.0
         self.arb_count = 0
 
     def find_arbitrage_opportunities(self) -> list[ArbitrageOpportunity]:
-        """
-        Use Musashi API to find cross-platform arbitrage opportunities
-        Returns list of profitable spreads
-        """
+        """Poll Musashi API and return filtered ArbitrageOpportunity list."""
         try:
-            # Get arbitrage data from Musashi
             response = self.musashi.get_arbitrage(min_spread=MIN_SPREAD_PERCENT)
 
-            if not response or not response.get('success'):
+            if not response or not response.get("success"):
                 logger.debug("No arbitrage data from Musashi")
                 return []
 
-            arbs = response.get('arbitrage_opportunities', [])
-            if not arbs:
+            raw_opps = response.get("data", {}).get("opportunities", [])
+            if not raw_opps:
                 return []
 
-            opportunities = []
-
-            for arb in arbs:
+            opportunities: list[ArbitrageOpportunity] = []
+            for arb in raw_opps:
                 try:
-                    # Parse arbitrage data
-                    poly_market = arb.get('polymarket', {})
-                    kalshi_market = arb.get('kalshi', {})
-
-                    if not poly_market or not kalshi_market:
+                    opp = _parse_opportunity(arb)
+                    if opp is None:
                         continue
 
-                    poly_id = str(poly_market.get('id', ''))
-                    kalshi_id = str(kalshi_market.get('id', ''))
-
-                    # Skip if already executed
-                    arb_key = f"{poly_id}:{kalshi_id}"
+                    arb_key = f"{opp.poly_market_id}:{opp.kalshi_market_id}"
                     if arb_key in self.executed_arbs:
                         continue
 
-                    # Get prices
-                    poly_yes_price = float(poly_market.get('yesPrice', 0))
-                    kalshi_yes_price = float(kalshi_market.get('yesPrice', 0))
+                    opportunities.append(opp)
+                except Exception as exc:
+                    logger.debug("Error parsing arbitrage entry: %s", exc)
 
-                    if poly_yes_price == 0 or kalshi_yes_price == 0:
-                        continue
-
-                    # Calculate spread
-                    spread = abs(poly_yes_price - kalshi_yes_price)
-                    spread_percent = spread / min(poly_yes_price, kalshi_yes_price)
-
-                    # Must meet minimum spread
-                    if spread_percent < MIN_SPREAD_PERCENT:
-                        continue
-
-                    # Check volume
-                    poly_volume = float(poly_market.get('volume', 0))
-                    kalshi_volume = float(kalshi_market.get('volume', 0))
-
-                    if poly_volume < MIN_VOLUME_USD or kalshi_volume < MIN_VOLUME_USD:
-                        logger.debug(f"Low volume: poly=${poly_volume:.0f} kalshi=${kalshi_volume:.0f}")
-                        continue
-
-                    # Determine buy/sell platforms
-                    if poly_yes_price < kalshi_yes_price:
-                        buy_platform = "polymarket"
-                        sell_platform = "kalshi"
-                    else:
-                        buy_platform = "kalshi"
-                        sell_platform = "polymarket"
-
-                    # Calculate profit (spread × position size)
-                    profit_usd = spread * POSITION_SIZE_USD
-
-                    opportunity = ArbitrageOpportunity(
-                        poly_market_id=poly_id,
-                        kalshi_market_id=kalshi_id,
-                        title=poly_market.get('question', 'Unknown'),
-                        poly_price=poly_yes_price,
-                        kalshi_price=kalshi_yes_price,
-                        spread_percent=spread_percent,
-                        buy_platform=buy_platform,
-                        sell_platform=sell_platform,
-                        profit_usd=profit_usd,
-                        poly_volume=poly_volume,
-                        kalshi_volume=kalshi_volume
-                    )
-
-                    opportunities.append(opportunity)
-
-                except Exception as e:
-                    logger.debug(f"Error parsing arbitrage: {e}")
-                    continue
-
-            # Sort by profit (highest first)
             opportunities.sort(key=lambda x: x.profit_usd, reverse=True)
-
             return opportunities
 
         except Exception as exc:
-            logger.error(f"Failed to find arbitrage: {exc}")
+            logger.error("Failed to find arbitrage: %s", exc)
             return []
 
-    def execute_arbitrage(self, opportunity: ArbitrageOpportunity):
-        """
-        Execute arbitrage trade on both platforms
-        """
+    def execute_arbitrage(self, opportunity: ArbitrageOpportunity) -> None:
+        """Log a simulation-only arbitrage trade and record it to disk."""
         try:
             logger.info("=" * 70)
-            logger.info("💰 ARBITRAGE OPPORTUNITY")
-            logger.info(f"Market: {opportunity.title[:50]}")
-            logger.info(f"Polymarket: {opportunity.poly_price*100:.1f}¢")
-            logger.info(f"Kalshi: {opportunity.kalshi_price*100:.1f}¢")
-            logger.info(f"Spread: {opportunity.spread_percent*100:.1f}%")
-            logger.info(f"Strategy: BUY on {opportunity.buy_platform.upper()}")
-            logger.info(f"         SELL on {opportunity.sell_platform.upper()}")
-            logger.info(f"Expected Profit: ${opportunity.profit_usd:.2f}")
+            logger.info("ARBITRAGE OPPORTUNITY (simulation)")
+            logger.info("Market: %s", opportunity.title[:60])
+            logger.info("Polymarket: %.1f¢", opportunity.poly_price * 100)
+            logger.info("Kalshi:     %.1f¢", opportunity.kalshi_price * 100)
+            logger.info("Spread:     %.1f%%", opportunity.spread_percent * 100)
+            logger.info("BUY  on %s", opportunity.buy_platform.upper())
+            logger.info("SELL on %s", opportunity.sell_platform.upper())
+            logger.info("Simulated profit: $%.2f", opportunity.profit_usd)
             logger.info("=" * 70)
 
-            # Mark as executed (prevent duplicate trades)
             arb_key = f"{opportunity.poly_market_id}:{opportunity.kalshi_market_id}"
             self.executed_arbs.add(arb_key)
 
-            # For paper trading, simulate the trade
-            # In live mode, you'd execute actual trades on both platforms
+            buy_price = (
+                opportunity.poly_price
+                if opportunity.buy_platform == "polymarket"
+                else opportunity.kalshi_price
+            )
+            sell_price = (
+                opportunity.kalshi_price
+                if opportunity.buy_platform == "polymarket"
+                else opportunity.poly_price
+            )
+            buy_market_id = (
+                opportunity.poly_market_id
+                if opportunity.buy_platform == "polymarket"
+                else opportunity.kalshi_market_id
+            )
+            sell_market_id = (
+                opportunity.kalshi_market_id
+                if opportunity.buy_platform == "polymarket"
+                else opportunity.poly_market_id
+            )
 
-            # Simulate buy leg
-            if opportunity.buy_platform == "polymarket":
-                buy_price = opportunity.poly_price
-                buy_market_id = opportunity.poly_market_id
-                sell_price = opportunity.kalshi_price
-                sell_market_id = opportunity.kalshi_market_id
-            else:
-                buy_price = opportunity.kalshi_price
-                buy_market_id = opportunity.kalshi_market_id
-                sell_price = opportunity.poly_price
-                sell_market_id = opportunity.poly_market_id
-
-            # Calculate profit
             shares = POSITION_SIZE_USD / buy_price
             realized_profit = (sell_price - buy_price) * shares
-
-            # Record the trade
-            from main import utc_now_iso
 
             trade_record = {
                 "opened_at": utc_now_iso(),
                 "closed_at": utc_now_iso(),
-                "strategy": "arbitrage",
+                "strategy": "arbitrage_simulation",
                 "poly_market_id": opportunity.poly_market_id,
                 "kalshi_market_id": opportunity.kalshi_market_id,
+                "buy_market_id": buy_market_id,
+                "sell_market_id": sell_market_id,
                 "title": opportunity.title,
                 "buy_platform": opportunity.buy_platform,
                 "sell_platform": opportunity.sell_platform,
@@ -214,63 +209,61 @@ class ArbitrageStrategy:
                 "shares": shares,
                 "realized_pnl": realized_profit,
                 "poly_volume": opportunity.poly_volume,
-                "kalshi_volume": opportunity.kalshi_volume
+                "kalshi_volume": opportunity.kalshi_volume,
             }
 
-            # Log trade to file
-            import json
-            with open("bot/data/arbitrage_trades.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(trade_record) + "\n")
+            _ARB_TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with _ARB_TRADES_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(trade_record) + "\n")
 
             self.total_profit += realized_profit
             self.arb_count += 1
 
-            logger.info(f"✅ ARBITRAGE EXECUTED")
-            logger.info(f"Buy: {shares:.2f} shares @ {buy_price*100:.1f}¢ on {opportunity.buy_platform}")
-            logger.info(f"Sell: {shares:.2f} shares @ {sell_price*100:.1f}¢ on {opportunity.sell_platform}")
-            logger.info(f"Realized Profit: ${realized_profit:.2f}")
-            logger.info(f"Total Arbitrage Profit: ${self.total_profit:.2f} ({self.arb_count} trades)")
+            logger.info(
+                "SIMULATED: buy %.2f shares @ %.1f¢ on %s, sell @ %.1f¢ on %s",
+                shares,
+                buy_price * 100,
+                opportunity.buy_platform,
+                sell_price * 100,
+                opportunity.sell_platform,
+            )
+            logger.info(
+                "Simulated profit: $%.2f | Session total: $%.2f (%d trades)",
+                realized_profit,
+                self.total_profit,
+                self.arb_count,
+            )
 
         except Exception as exc:
-            logger.exception(f"Failed to execute arbitrage: {exc}")
+            logger.exception("Failed to execute arbitrage: %s", exc)
 
-    def run_scanner(self):
-        """
-        Main arbitrage scanner loop
-        Continuously scans for cross-platform price spreads
-        """
+    def run_scanner(self) -> None:
+        """Continuous loop: scan for opportunities, log and record the best one."""
         logger.info("=" * 70)
-        logger.info("ARBITRAGE STRATEGY STARTED")
-        logger.info(f"Min Spread: {MIN_SPREAD_PERCENT*100:.0f}%")
-        logger.info(f"Position Size: ${POSITION_SIZE_USD} per leg")
-        logger.info(f"Scan Interval: {SCAN_INTERVAL_SECONDS}s")
-        logger.info(f"Trading: Polymarket <-> Kalshi")
-        logger.info("Strategy: Pure arbitrage (risk-free profit)")
+        logger.info("ARBITRAGE SCANNER STARTED (simulation only)")
+        logger.info("Min spread:     %.0f%%", MIN_SPREAD_PERCENT * 100)
+        logger.info("Position size:  $%.0f per leg", POSITION_SIZE_USD)
+        logger.info("Scan interval:  %ds", SCAN_INTERVAL_SECONDS)
+        logger.info("Platforms:      Polymarket <-> Kalshi")
+        logger.info("NOTE: No real orders are placed. All trades are paper-only.")
         logger.info("=" * 70)
 
         while True:
             try:
-                # Find arbitrage opportunities
                 opportunities = self.find_arbitrage_opportunities()
-
                 if opportunities:
-                    logger.info(f"Found {len(opportunities)} arbitrage opportunities!")
-
-                    # Execute best opportunity
-                    best = opportunities[0]
-                    self.execute_arbitrage(best)
+                    logger.info("Found %d opportunity/ies", len(opportunities))
+                    self.execute_arbitrage(opportunities[0])
                 else:
-                    logger.debug("No arbitrage opportunities found")
+                    logger.debug("No arbitrage opportunities found this scan")
 
-                # Clean up old executed_arbs tracking (keep last 500)
+                # Cap dedup set to avoid unbounded growth
                 if len(self.executed_arbs) > 500:
-                    to_remove = list(self.executed_arbs)[:250]
-                    for key in to_remove:
+                    for key in list(self.executed_arbs)[:250]:
                         self.executed_arbs.discard(key)
 
-                # Scan every 5 seconds
                 time.sleep(SCAN_INTERVAL_SECONDS)
 
             except Exception as exc:
-                logger.exception(f"Arbitrage scanner error: {exc}")
+                logger.exception("Arbitrage scanner error: %s", exc)
                 time.sleep(10)

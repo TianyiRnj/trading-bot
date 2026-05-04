@@ -33,6 +33,38 @@ cp .env.example .env
 
 Once the environment is ready, you can move directly into the minimum startup flow.
 
+## Postgres Preparation
+
+The repository now includes the configuration files needed to prepare a local Postgres instance for the upcoming storage migration:
+
+- `docker-compose.yml`
+- `db/init/001_init.sql`
+- Postgres environment variables in `.env.example`
+- Python Postgres driver dependency in `requirements.txt`
+
+Start a local Postgres instance from the repository root with:
+
+```bash
+docker compose up -d postgres
+```
+
+The default bootstrap values in `.env.example` are:
+
+```bash
+DATABASE_URL=postgresql://musashi:musashi_dev_password@127.0.0.1:5432/musashi_trading_bot
+POSTGRES_HOST=127.0.0.1
+POSTGRES_PORT=5432
+POSTGRES_DB=musashi_trading_bot
+POSTGRES_USER=musashi
+POSTGRES_PASSWORD=musashi_dev_password
+POSTGRES_SSLMODE=disable
+POSTGRES_POOL_MIN=1
+POSTGRES_POOL_MAX=5
+POSTGRES_CONNECT_TIMEOUT_SECONDS=10
+```
+
+At the moment, the runtime code still reads and writes the local JSON / JSONL files described below. The Postgres files are preparatory and intended to be used by the upcoming runtime migration.
+
 ## Quick Start
 
 If you want the shortest path to a working local run, use the commands below from the repository root:
@@ -50,6 +82,8 @@ That will start the bot with whatever values are currently defined in `.env`, so
 ## Configuration
 
 Before launching the bot in earnest, open `.env` and decide whether you want to run in paper mode or live mode. Starting in paper mode is the safest way to confirm that signal selection, logging, and position handling behave as expected.
+
+If you plan to use the prepared Postgres configuration, make sure `DATABASE_URL` and the `POSTGRES_*` values in `.env` match the database you want to run against.
 
 ### Paper Trading
 
@@ -118,9 +152,39 @@ python3 bot/main.py
 
 As the bot runs, it will write logs and local state files so you can inspect what it is doing over time.
 
+## Arbitrage Scanner (Optional, Simulation Only)
+
+The repository includes a cross-platform spread scanner that compares YES prices between Polymarket and Kalshi. It is **disabled by default** and runs in **simulation only** — no real Kalshi orders are ever placed.
+
+To enable it, set the following in `.env`:
+
+```bash
+BOT_ENABLE_ARBITRAGE=true
+```
+
+When enabled, the scanner runs as a background thread alongside the main Musashi signal loop and writes simulated trade records to `bot/data/arbitrage_trades.jsonl`.
+
+## Arbitrage Dashboard (Flask)
+
+A lightweight Flask dashboard displays simulated arbitrage results. All metrics (bankroll, profit, win rate) reflect paper trades only.
+
+Install the dashboard dependency if you have not already:
+
+```bash
+pip install -r requirements.txt  # includes flask>=3.0.0 and psycopg[binary]
+```
+
+Run from the project root (with `BOT_ENABLE_ARBITRAGE=true` and the bot running to generate trade data):
+
+```bash
+python3 dashboard.py
+```
+
+The dashboard is available at `http://127.0.0.1:5000`.
+
 ## Output Files
 
-The bot writes the following files during operation:
+The current runtime still writes the following files during operation:
 
 - `bot/logs/bot.log`
 - `bot/data/positions.json`
@@ -128,6 +192,13 @@ The bot writes the following files during operation:
 - `bot/data/seen_event_ids.json`
 
 Those files are useful for monitoring the current state, reviewing trade history, and understanding how the bot reached its decisions.
+
+In addition, the repository now includes the prepared Postgres bootstrap files:
+
+- `docker-compose.yml`
+- `db/init/001_init.sql`
+
+Those files define the local development database container and the initial schema for the planned migration to Postgres-backed runtime state.
 
 ## Running in the Background
 

@@ -12,3 +12,5 @@ __pycache__/
 htmlcov/
 bot/data/
 bot/logs/
+agents.md
+claude.md

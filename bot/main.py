@@ -12,6 +12,10 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 from requests import exceptions as requests_exceptions
+try:
+    from utils import utc_now_iso, parse_iso_datetime          # script: python bot/main.py
+except ImportError:
+    from bot.utils import utc_now_iso, parse_iso_datetime      # package: python -m bot.main
 
 load_dotenv()
 
@@ -34,6 +38,7 @@ EXIT_ON_SIGNAL_REVERSAL = os.getenv("BOT_EXIT_ON_SIGNAL_REVERSAL", "true").lower
 EXIT_ORDER_TIMEOUT_SECONDS = int(os.getenv("BOT_EXIT_ORDER_TIMEOUT_SECONDS", "120"))
 EXIT_ORDER_REPRICE = os.getenv("BOT_EXIT_ORDER_REPRICE", "true").lower() == "true"
 STARTUP_RECONCILE = os.getenv("BOT_STARTUP_RECONCILE", "true").lower() == "true"
+BOT_ENABLE_ARBITRAGE = os.getenv("BOT_ENABLE_ARBITRAGE", "false").lower() == "true"
 POLYMARKET_WS_ENABLED = os.getenv("POLYMARKET_WS_ENABLED", "true").lower() == "true"
 RESTRICTED_COUNTRIES = {
     item.strip().upper()
@@ -66,20 +71,25 @@ PENDING_ORDERS_FILE = DATA_DIR / "pending_orders.json"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(LOG_DIR / "bot.log", mode="w"), logging.StreamHandler()],
-)
 logger = logging.getLogger("musashi-poly-bot")
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def configure_logging() -> None:
+    """Configure root logger with file (append) and stream handlers.
 
-
-def parse_iso_datetime(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    Must be called from the runtime entry path only, not on import.
+    Uses force=True so the setup is deterministic even if another module
+    touched logging earlier.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_DIR / "bot.log", mode="a"),
+            logging.StreamHandler(),
+        ],
+        force=True,
+    )
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -899,16 +909,20 @@ class Bot:
         )
         self.startup_geo_profile: dict[str, str] | None = None
 
-        # Initialize Pure Arbitrage strategy
-        from arbitrage_strategy import ArbitrageStrategy
-        self.arbitrage_strategy = ArbitrageStrategy(
-            gamma_client=self.gamma,
-            musashi_client=self.musashi,
-            trader=self.trader,
-            positions=self.positions,
-            save_state_callback=self.save_state
-        )
+        self.arbitrage_strategy = None
         self.arbitrage_thread = None
+        if BOT_ENABLE_ARBITRAGE:
+            try:
+                from arbitrage_strategy import ArbitrageStrategy      # script
+            except ImportError:
+                from bot.arbitrage_strategy import ArbitrageStrategy   # package
+            self.arbitrage_strategy = ArbitrageStrategy(
+                gamma_client=self.gamma,
+                musashi_client=self.musashi,
+                trader=self.trader,
+                positions=self.positions,
+                save_state_callback=self.save_state,
+            )
 
     def current_exposure(self) -> float:
         return sum(float(position.get("size_usd", 0)) for position in self.positions.values())
@@ -1681,14 +1695,18 @@ class Bot:
             self.start_realtime_streams()
             self.reconcile_startup_state()
 
-            # Start Pure Arbitrage strategy in background thread
-            logger.info("Starting Pure Arbitrage strategy (Polymarket <-> Kalshi)")
-            self.arbitrage_thread = threading.Thread(
-                target=self.arbitrage_strategy.run_scanner,
-                name="arbitrage-scanner",
-                daemon=True
-            )
-            self.arbitrage_thread.start()
+            if BOT_ENABLE_ARBITRAGE and self.arbitrage_strategy:
+                logger.info("Starting arbitrage scanner (simulation-only mode)")
+                self.arbitrage_thread = threading.Thread(
+                    target=self.arbitrage_strategy.run_scanner,
+                    name="arbitrage-scanner",
+                    daemon=True,
+                )
+                self.arbitrage_thread.start()
+            else:
+                logger.info(
+                    "Arbitrage scanner disabled (set BOT_ENABLE_ARBITRAGE=true to enable)"
+                )
 
             while True:
                 loop_started_at = time.time()
@@ -1725,4 +1743,5 @@ class Bot:
 
 
 if __name__ == "__main__":
+    configure_logging()
     Bot().run()
