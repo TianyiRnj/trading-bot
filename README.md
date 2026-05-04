@@ -33,6 +33,15 @@ cp .env.example .env
 
 Once the environment is ready, you can move directly into the minimum startup flow.
 
+If the repository has been moved or renamed since `.venv` was created, the virtual environment scripts may still point at the old path. In that case, rebuild it before installing dependencies:
+
+```bash
+rm -rf .venv
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
 ## Postgres Preparation
 
 The repository now includes the configuration files needed to prepare a local Postgres instance for the upcoming storage migration:
