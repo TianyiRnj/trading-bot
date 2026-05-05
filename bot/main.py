@@ -1,8 +1,10 @@
 import json
 import logging
 import os
+import signal
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,11 +18,19 @@ try:
     from utils import utc_now_iso, parse_iso_datetime          # script: python bot/main.py
 except ImportError:
     from bot.utils import utc_now_iso, parse_iso_datetime      # package: python -m bot.main
+try:
+    from db import init_pool, close_pool, get_db, check_db_available   # script path
+    import repository as repo                                           # script path
+except ImportError:
+    from bot.db import init_pool, close_pool, get_db, check_db_available  # package path
+    import bot.repository as repo                                          # package path
 
 load_dotenv()
 
 BASE_URL = os.getenv("MUSASHI_API_BASE_URL", "https://musashi-api.vercel.app").rstrip("/")
-BOT_MODE = os.getenv("BOT_MODE", "paper").strip().lower()
+REQUESTED_MODE = os.getenv("BOT_MODE", "paper").strip().lower()
+ACCOUNT_KEY = "main"
+PAPER_GEO_STRICT = os.getenv("BOT_PAPER_GEO_STRICT", "false").lower() == "true"
 SCAN_INTERVAL_SECONDS = int(os.getenv("BOT_SCAN_INTERVAL_SECONDS", "45"))
 MIN_CONFIDENCE = float(os.getenv("BOT_MIN_CONFIDENCE", "0.76"))
 MIN_EDGE = float(os.getenv("BOT_MIN_EDGE", "0.05"))
@@ -54,6 +64,9 @@ RESTRICTED_REGIONS = {
 }
 MUSASHI_CONNECT_TIMEOUT_SECONDS = float(os.getenv("MUSASHI_CONNECT_TIMEOUT_SECONDS", "10"))
 MUSASHI_READ_TIMEOUT_SECONDS = float(os.getenv("MUSASHI_READ_TIMEOUT_SECONDS", "30"))
+POSTGRES_POOL_MIN = int(os.getenv("POSTGRES_POOL_MIN", "1"))
+POSTGRES_POOL_MAX = int(os.getenv("POSTGRES_POOL_MAX", "5"))
+POSTGRES_CONNECT_TIMEOUT_SECONDS = float(os.getenv("POSTGRES_CONNECT_TIMEOUT_SECONDS", "10"))
 
 POLYMARKET_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com").rstrip("/")
 POLYMARKET_CHAIN_ID = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
@@ -61,14 +74,7 @@ POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 POLYMARKET_SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))
 POLYMARKET_FUNDER = os.getenv("POLYMARKET_FUNDER", "")
 
-DATA_DIR = Path("bot/data")
 LOG_DIR = Path("bot/logs")
-POSITIONS_FILE = DATA_DIR / "positions.json"
-TRADES_FILE = DATA_DIR / "trades.jsonl"
-SEEN_FILE = DATA_DIR / "seen_event_ids.json"
-PENDING_ORDERS_FILE = DATA_DIR / "pending_orders.json"
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("musashi-poly-bot")
@@ -90,21 +96,6 @@ def configure_logging() -> None:
         ],
         force=True,
     )
-
-
-def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    return json.loads(path.read_text())
-
-
-def save_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2))
-
-
-def append_jsonl(path: Path, value: dict[str, Any]) -> None:
-    with path.open("a") as handle:
-        handle.write(json.dumps(value) + "\n")
 
 
 def extract_health_status(payload: Any) -> str:
@@ -887,27 +878,182 @@ def realized_pnl_usd(entry_probability: float, current_probability: float, share
     return round((current_probability - entry_probability) * shares, 4)
 
 
+def position_market_value_usd(shares: float, current_probability: float) -> float:
+    bounded_probability = min(max(as_float(current_probability), 0.0), 1.0)
+    return round(max(shares, 0.0) * bounded_probability, 6)
+
+
+def mark_position_to_market(position: dict[str, Any], current_probability: float) -> dict[str, Any]:
+    shares = current_position_shares(position)
+    current_probability = min(max(as_float(current_probability), 0.0), 1.0)
+    current_value_usd = position_market_value_usd(shares, current_probability)
+    remaining_cost_basis = round(as_float(position.get("size_usd"), position_cost_basis_usd(position, shares)), 6)
+    unrealized = round(current_value_usd - remaining_cost_basis, 6)
+    return {
+        **position,
+        "current_probability": current_probability,
+        "current_value_usd": current_value_usd,
+        "unrealized_pnl_usd": unrealized,
+    }
+
+
 def current_position_shares(position: dict[str, Any]) -> float:
     return as_float(position.get("shares"), as_float(position.get("estimated_shares")))
 
 
+def position_cost_basis_usd(position: dict[str, Any], shares: float) -> float:
+    entry_probability = as_float(position.get("entry_probability"))
+    return round(max(shares, 0.0) * entry_probability, 6)
+
+
+def cumulative_executed_value_usd(
+    requested_shares: float,
+    remaining_shares: float,
+    execution_price: float,
+) -> float:
+    filled_shares = max(as_float(requested_shares) - max(as_float(remaining_shares), 0.0), 0.0)
+    return round(filled_shares * as_float(execution_price), 6)
+
+
+def _resolve_effective_mode_and_trader(
+    requested_mode: str,
+    public_client: "PolymarketPublicClient",
+) -> "tuple[str, str | None, PaperTrader | LiveTrader]":
+    if requested_mode != "live":
+        return requested_mode, None, PaperTrader()
+
+    if not POLYMARKET_PRIVATE_KEY or not POLYMARKET_FUNDER:
+        return "paper", "missing_credentials", PaperTrader()
+
+    try:
+        geo = public_client.geoblock()
+        if bool(geo.get("blocked")):
+            return "paper", "geoblock_blocked", PaperTrader()
+        country = str(geo.get("country") or "").strip().upper()
+        if country in RESTRICTED_COUNTRIES:
+            return "paper", f"geoblock_restricted_country:{country}", PaperTrader()
+    except Exception as exc:
+        return "paper", f"geoblock_check_failed:{type(exc).__name__}", PaperTrader()
+
+    try:
+        trader = LiveTrader()
+        return "live", None, trader
+    except Exception as exc:
+        return "paper", f"live_trader_init_failed:{exc}", PaperTrader()
+
+
 class Bot:
     def __init__(self) -> None:
+        self.requested_mode = REQUESTED_MODE
         self.musashi = MusashiClient(BASE_URL)
         self.polymarket_public = PolymarketPublicClient()
         self.geolocation = GeolocationClient()
         self.gamma = PolymarketGammaClient()
-        self.positions = load_json(POSITIONS_FILE, {})
-        self.seen_event_ids = set(load_json(SEEN_FILE, []))
-        self.pending_orders = load_json(PENDING_ORDERS_FILE, {})
-        self.trader = LiveTrader() if BOT_MODE == "live" else PaperTrader()
+
+        self.startup_geo_profile: dict[str, str] | None = None
+        self._shutdown_requested = False
+        self.mode_run_id: int | None = None
+        self.protection_mode_reason: str | None = None
+        self.pending_fallback_reason: str | None = None
+
+        self.effective_mode, self.fallback_reason, self.trader = (
+            _resolve_effective_mode_and_trader(REQUESTED_MODE, self.polymarket_public)
+        )
+
+        try:
+            init_pool(
+                min_size=POSTGRES_POOL_MIN,
+                max_size=POSTGRES_POOL_MAX,
+                timeout=POSTGRES_CONNECT_TIMEOUT_SECONDS,
+            )
+        except RuntimeError as exc:
+            logger.critical("Cannot init DB pool: %s", exc)
+            raise SystemExit(1) from exc
+
+        ok, error = check_db_available()
+        if not ok:
+            logger.critical("Database not available: %s", error)
+            raise SystemExit(1)
+
+        if self.effective_mode == "paper":
+            try:
+                with get_db() as conn:
+                    if repo.has_live_exposure(conn):
+                        logger.critical(
+                            "Cannot start with effective paper mode while live exposure exists in DB. "
+                            "Reconcile manually before restarting. requested_mode=%s fallback_reason=%s",
+                            self.requested_mode,
+                            self.fallback_reason,
+                        )
+                        raise SystemExit(1)
+            except SystemExit:
+                raise
+            except Exception as exc:
+                logger.critical("Failed to verify live exposure before startup: %s", exc)
+                raise SystemExit(1) from exc
+        if self.requested_mode == "live" and self.effective_mode == "paper":
+            logger.warning(
+                "Degrading from live to paper mode. fallback_reason=%s",
+                self.fallback_reason,
+            )
+
+        run_label = os.getenv("BOT_RUN_LABEL", "default")
+        try:
+            with get_db() as conn:
+                self.mode_run_id = repo.insert_mode_run(
+                    conn, run_label, self.requested_mode, self.effective_mode, self.fallback_reason
+                )
+                repo.upsert_account_state(
+                    conn,
+                    account_key=ACCOUNT_KEY,
+                    initial_bankroll=BANKROLL_USD,
+                    requested_mode=self.requested_mode,
+                    effective_mode=self.effective_mode,
+                )
+        except Exception as exc:
+            logger.warning("DB setup writes failed (mode_run / account_state): %s", exc)
+
+        try:
+            with get_db() as conn:
+                self.positions = repo.load_open_positions(conn, effective_mode=self.effective_mode)
+                self.pending_orders = repo.load_pending_orders(conn, effective_mode=self.effective_mode)
+                self.seen_event_ids = repo.load_seen_events(conn)
+                self.account_state = repo.get_account_state(conn, ACCOUNT_KEY) or {}
+        except Exception as exc:
+            logger.warning("Failed to load state from DB: %s — starting with empty state", exc)
+            self.positions = {}
+            self.pending_orders = {}
+            self.seen_event_ids = set()
+            self.account_state = {}
+
+        if not self.account_state:
+            self.account_state = {
+                "account_key": ACCOUNT_KEY,
+                "initial_bankroll": BANKROLL_USD,
+                "requested_mode": self.requested_mode,
+                "effective_mode": self.effective_mode,
+                "cash_balance": BANKROLL_USD,
+                "positions_value": 0.0,
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "equity": BANKROLL_USD,
+                "max_equity": BANKROLL_USD,
+                "drawdown": 0.0,
+            }
+
+        logger.info(
+            "Bot requested_mode=%s effective_mode=%s fallback_reason=%s "
+            "positions=%d pending_orders=%d seen_events=%d",
+            self.requested_mode, self.effective_mode, self.fallback_reason,
+            len(self.positions), len(self.pending_orders), len(self.seen_event_ids),
+        )
+
         self.market_stream = PolymarketMarketStream(enabled=POLYMARKET_WS_ENABLED)
         self.user_stream = (
             PolymarketUserStream(self.trader.ws_auth_payload(), enabled=POLYMARKET_WS_ENABLED)
             if isinstance(self.trader, LiveTrader)
             else None
         )
-        self.startup_geo_profile: dict[str, str] | None = None
 
         self.arbitrage_strategy = None
         self.arbitrage_thread = None
@@ -924,17 +1070,195 @@ class Bot:
                 save_state_callback=self.save_state,
             )
 
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
     def current_exposure(self) -> float:
-        return sum(float(position.get("size_usd", 0)) for position in self.positions.values())
+        return round(
+            sum(
+                as_float(position.get("current_value_usd"), as_float(position.get("size_usd"), 0.0))
+                for position in self.positions.values()
+            ),
+            6,
+        )
 
     def bankroll_remaining(self) -> float:
-        remaining = BANKROLL_USD - self.current_exposure()
-        return max(0.0, round(remaining, 2))
+        cash_balance = as_float(self.account_state.get("cash_balance"), BANKROLL_USD)
+        return max(0.0, round(cash_balance, 2))
 
     def save_state(self) -> None:
-        save_json(POSITIONS_FILE, self.positions)
-        save_json(PENDING_ORDERS_FILE, self.pending_orders)
         self.sync_realtime_subscriptions()
+
+    def refresh_account_state_from_db(self) -> dict[str, Any]:
+        try:
+            with get_db() as conn:
+                account_state = repo.get_account_state(conn, ACCOUNT_KEY)
+                if account_state is not None:
+                    self.account_state = account_state
+        except Exception as exc:
+            logger.warning("Failed to refresh account_state from DB: %s", exc)
+        return self.account_state
+
+    def persist_runtime_state(self, reason: str = "runtime") -> None:
+        self.sync_realtime_subscriptions()
+        try:
+            with get_db() as conn:
+                for position in self.positions.values():
+                    repo.upsert_position(
+                        conn,
+                        position,
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                    )
+                for pending_order in self.pending_orders.values():
+                    repo.upsert_pending_order(
+                        conn,
+                        pending_order,
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                    )
+                if self.mode_run_id is not None:
+                    repo.update_mode_heartbeat(conn, self.mode_run_id)
+        except Exception as exc:
+            logger.warning("Runtime flush failed (%s): %s", reason, exc)
+
+    def sync_account_market_state(
+        self,
+        *,
+        refresh_prices: bool,
+        persist_positions: bool = True,
+    ) -> dict[str, Any]:
+        updated_positions: dict[str, dict[str, Any]] = {}
+        total_value = 0.0
+        total_unrealized = 0.0
+
+        for market_id, position in list(self.positions.items()):
+            try:
+                if refresh_prices:
+                    probability = self.latest_position_probability(position)
+                else:
+                    probability = as_float(
+                        position.get("current_probability"),
+                        as_float(position.get("entry_probability"), 0.5),
+                    )
+                marked = mark_position_to_market(position, probability)
+                updated_positions[market_id] = marked
+                total_value += as_float(marked.get("current_value_usd"))
+                total_unrealized += as_float(marked.get("unrealized_pnl_usd"))
+            except Exception as exc:
+                logger.warning("Failed to mark position %s to market: %s", market_id, exc)
+                updated_positions[market_id] = position
+                total_value += as_float(position.get("current_value_usd"), as_float(position.get("size_usd")))
+                total_unrealized += as_float(position.get("unrealized_pnl_usd"))
+
+        self.positions = updated_positions
+
+        try:
+            with get_db() as conn:
+                if persist_positions:
+                    for position in self.positions.values():
+                        repo.upsert_position(
+                            conn,
+                            position,
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                        )
+                repo.update_account_market_state(
+                    conn,
+                    ACCOUNT_KEY,
+                    positions_value=round(total_value, 6),
+                    unrealized_pnl=round(total_unrealized, 6),
+                )
+            self.refresh_account_state_from_db()
+        except Exception as exc:
+            logger.warning("Account mark-to-market sync failed: %s", exc)
+
+        return self.account_state
+
+    def has_live_exposure(self) -> bool:
+        try:
+            with get_db() as conn:
+                return repo.has_live_exposure(conn)
+        except Exception as exc:
+            logger.warning("Failed to inspect live exposure: %s", exc)
+        return bool(self.positions or self.pending_orders)
+
+    def activate_paper_mode(self, reason: str, context: str) -> None:
+        if self.effective_mode == "paper":
+            return
+        self.effective_mode = "paper"
+        self.fallback_reason = f"{context}:{reason}"[:500]
+        self.pending_fallback_reason = None
+        self.protection_mode_reason = None
+        self.trader = PaperTrader()
+        if self.user_stream:
+            self.user_stream.stop()
+        self.user_stream = None
+        if self.mode_run_id is not None:
+            try:
+                with get_db() as conn:
+                    repo.update_mode_run_state(
+                        conn,
+                        self.mode_run_id,
+                        effective_mode=self.effective_mode,
+                        fallback_reason=self.fallback_reason,
+                    )
+                    repo.update_account_modes(
+                        conn,
+                        ACCOUNT_KEY,
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                    )
+            except Exception as exc:
+                logger.warning("Failed to persist paper fallback: %s", exc)
+        self.refresh_account_state_from_db()
+        self.save_state()
+        logger.warning(
+            "Runtime mode fallback activated: requested_mode=%s effective_mode=%s reason=%s",
+            self.requested_mode,
+            self.effective_mode,
+            self.fallback_reason,
+        )
+
+    def enter_live_protection(self, reason: str, context: str) -> None:
+        protection_reason = f"{context}:{reason}"[:500]
+        if self.protection_mode_reason == protection_reason:
+            return
+        self.protection_mode_reason = protection_reason
+        self.pending_fallback_reason = reason
+        logger.critical(
+            "Live protection mode active; new entries paused until live exposure is flat. reason=%s",
+            protection_reason,
+        )
+        if self.mode_run_id is not None:
+            try:
+                with get_db() as conn:
+                    repo.update_mode_run_state(
+                        conn,
+                        self.mode_run_id,
+                        effective_mode=self.effective_mode,
+                        fallback_reason=protection_reason,
+                        status="protecting",
+                    )
+            except Exception as exc:
+                logger.warning("Failed to persist protection-mode state: %s", exc)
+
+    def attempt_runtime_paper_fallback(self, reason: str, context: str) -> bool:
+        if self.requested_mode != "live" or self.effective_mode != "live":
+            return False
+        if self.has_live_exposure():
+            self.enter_live_protection(reason, context)
+            return False
+        self.activate_paper_mode(reason, context)
+        return True
+
+    def evaluate_live_protection_transition(self) -> None:
+        if not self.protection_mode_reason:
+            return
+        if self.has_live_exposure():
+            return
+        fallback_reason = self.pending_fallback_reason or "live_protection_complete"
+        logger.warning("Live exposure is flat; completing fallback to paper mode")
+        self.activate_paper_mode(fallback_reason, "live_protection")
 
     def _log_geo(self, prefix: str, location: dict[str, Any]) -> None:
         logger.info(
@@ -970,6 +1294,17 @@ class Bot:
         return profile
 
     def assert_runtime_safety(self, context: str, *, log_checks: bool = False) -> None:
+        if self.effective_mode == "paper" and not PAPER_GEO_STRICT:
+            try:
+                location = self.geolocation.locate()
+                if location:
+                    if log_checks:
+                        self._log_geo("Paper mode geolocation (advisory):", location)
+                    self._assert_location_profile_allowed(location, context)
+            except SafetyShutdown as exc:
+                logger.warning("[paper] safety advisory (non-fatal): %s", exc)
+            return
+
         location = self.geolocation.locate()
         if not location:
             raise SafetyShutdown(f"{context}: geolocation unavailable; refusing to continue")
@@ -1093,6 +1428,28 @@ class Bot:
         )
         return any(marker in text for marker in risk_markers)
 
+    @staticmethod
+    def response_indicates_live_unavailable(response: dict[str, Any]) -> str | None:
+        if not isinstance(response, dict):
+            return None
+        text = json.dumps(response).lower()
+        markers = {
+            "insufficient balance": "insufficient_balance",
+            "not enough balance": "insufficient_balance",
+            "insufficient funds": "insufficient_balance",
+            "balance too low": "insufficient_balance",
+            "allowance": "allowance_missing_or_invalid",
+            "unauthorized": "invalid_credentials",
+            "invalid api key": "invalid_credentials",
+            "invalid signature": "invalid_credentials",
+            "authentication": "invalid_credentials",
+            "credential": "invalid_credentials",
+        }
+        for marker, reason in markers.items():
+            if marker in text:
+                return reason
+        return None
+
     def pending_exit_order_for_market(self, market_id: str) -> tuple[str, dict[str, Any]] | None:
         for order_id, pending in self.pending_orders.items():
             if str(pending.get("market_id")) == str(market_id):
@@ -1100,6 +1457,8 @@ class Bot:
         return None
 
     def assert_live_trading_allowed(self) -> None:
+        if isinstance(self.trader, LiveTrader):
+            self.trader.ws_auth_payload()
         self.assert_runtime_safety("startup", log_checks=True)
 
     def should_trade(self, signal_payload: dict[str, Any]) -> Decision | None:
@@ -1169,7 +1528,11 @@ class Bot:
 
     def record_seen(self, event_id: str) -> None:
         self.seen_event_ids.add(event_id)
-        save_json(SEEN_FILE, sorted(self.seen_event_ids))
+        try:
+            with get_db() as conn:
+                repo.insert_seen_event(conn, event_id)
+        except Exception as exc:
+            logger.warning("Failed to persist seen event %s: %s", event_id, exc)
 
     def apply_exit_fill_to_position(
         self,
@@ -1186,6 +1549,7 @@ class Bot:
         sold_shares = min(max(sold_shares, 0.0), current_shares)
         remaining_shares = round(max(current_shares - sold_shares, 0.0), 6)
         pnl_usd = realized_pnl_usd(float(position["entry_probability"]), execution_price, sold_shares)
+        total_realized_pnl_usd = round(as_float(position.get("realized_pnl_usd")) + pnl_usd, 6)
 
         closed_event = {
             **position,
@@ -1195,6 +1559,7 @@ class Bot:
             "sold_shares": sold_shares,
             "remaining_shares": remaining_shares,
             "realized_pnl_usd_estimate": pnl_usd,
+            "total_realized_pnl_usd": total_realized_pnl_usd,
             "close_order_id": order_id,
             "close_order_status": order_status,
             "close_response": response,
@@ -1210,7 +1575,13 @@ class Bot:
                 "estimated_shares": remaining_shares,
                 "size_usd": round(remaining_shares * float(position["entry_probability"]), 6),
                 "last_response": response,
-                "realized_pnl_usd": round(as_float(position.get("realized_pnl_usd")) + pnl_usd, 6),
+                "realized_pnl_usd": total_realized_pnl_usd,
+                "current_probability": execution_price,
+                "current_value_usd": round(remaining_shares * execution_price, 6),
+                "unrealized_pnl_usd": round(
+                    (execution_price - float(position["entry_probability"])) * remaining_shares,
+                    6,
+                ),
             }
             self.positions[market_id] = updated_position
 
@@ -1224,9 +1595,18 @@ class Bot:
         return any(position.get("event_id") == event_id for position in self.positions.values())
 
     def execute_trade(self, decision: Decision) -> None:
-        self.assert_runtime_safety("pre-entry")
+        if self.protection_mode_reason:
+            logger.warning("Skipped new entry because protection mode is active: %s", self.protection_mode_reason)
+            return
+        try:
+            self.assert_runtime_safety("pre-entry")
+        except SafetyShutdown as exc:
+            if self.attempt_runtime_paper_fallback("startup_or_runtime_safety_failed", "pre_entry"):
+                return self.execute_trade(decision)
+            raise
         market = decision.market
         market_id = str(market["id"])
+        client_order_id = f"entry-{uuid.uuid4()}"
 
         if self.already_holding(market_id, decision.event_id):
             logger.info("Skipped %s because position already exists for market/event", market_id)
@@ -1250,6 +1630,8 @@ class Bot:
             },
         )
         if self.response_indicates_ban_risk(response):
+            if self.attempt_runtime_paper_fallback("compliance_or_geoblock", "pre_entry_response"):
+                return self.execute_trade(decision)
             raise SafetyShutdown(f"pre-entry: Polymarket response indicates compliance/geoblock risk; terminating: {response}")
         fill = parse_fill_result(
             response=response,
@@ -1257,22 +1639,84 @@ class Bot:
             requested_value_usd=size_usd,
             requested_shares=estimate_shares(size_usd, decision.probability),
         )
+        order_id = fill.order_id or client_order_id
+        requested_shares = estimate_shares(size_usd, decision.probability)
         if not fill.success:
             logger.warning("Entry order for %s returned no fill: %s", market_id, response)
-            append_jsonl(
-                TRADES_FILE,
-                {
-                    "timestamp": utc_now_iso(),
-                    "type": f"{BOT_MODE}_entry_rejected",
-                    "market_id": market_id,
-                    "token_id": token_id,
-                    "response": response,
-                    "reason": decision.reason,
-                },
-            )
+            try:
+                with get_db() as conn:
+                    repo.upsert_order(
+                        conn,
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=fill.order_id,
+                        market_id=market_id,
+                        condition_id=condition_id,
+                        token_id=token_id,
+                        side="BUY",
+                        execution_mode="direct_execution",
+                        status=fill.status or "rejected",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        requested_price=decision.probability,
+                        requested_value_usd=size_usd,
+                        requested_shares=requested_shares,
+                        filled_shares=fill.filled_shares,
+                        executed_value_usd=fill.filled_value_usd,
+                        remaining_shares=max(requested_shares - fill.filled_shares, 0.0),
+                        fallback_reason=decision.reason,
+                        metadata={"response": response, "signal_type": decision.signal_type, "urgency": decision.urgency},
+                    )
+                    repo.insert_trade_event(
+                        conn,
+                        action_type="buy_submitted",
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=fill.order_id,
+                        market_id=market_id,
+                        token_id=token_id,
+                        condition_id=condition_id,
+                        status="submitted",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        execution_mode="direct_execution",
+                        requested_price=decision.probability,
+                        requested_value_usd=size_usd,
+                        requested_shares=requested_shares,
+                        reason=decision.reason,
+                        metadata={"signal_type": decision.signal_type, "urgency": decision.urgency},
+                    )
+                    repo.insert_trade_event(
+                        conn,
+                        action_type="rejected",
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=fill.order_id,
+                        market_id=market_id,
+                        token_id=token_id,
+                        condition_id=condition_id,
+                        status=fill.status or "rejected",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        execution_mode="direct_execution",
+                        requested_price=decision.probability,
+                        requested_value_usd=size_usd,
+                        requested_shares=requested_shares,
+                        filled_shares=fill.filled_shares,
+                        remaining_shares=max(requested_shares - fill.filled_shares, 0.0),
+                        reason=decision.reason,
+                        metadata={"response": response, "signal_type": decision.signal_type, "urgency": decision.urgency},
+                    )
+            except Exception as exc:
+                logger.warning("DB write failed (entry_rejected): %s", exc)
+            fallback_reason = self.response_indicates_live_unavailable(response)
+            if fallback_reason and self.attempt_runtime_paper_fallback(fallback_reason, "entry_rejected"):
+                return self.execute_trade(decision)
             return
 
+        current_value_usd = round(fill.filled_shares * fill.avg_price, 6)
         position = {
+            "position_id": str(uuid.uuid4()),
             "event_id": decision.event_id,
             "market_id": market_id,
             "title": market["title"],
@@ -1288,27 +1732,99 @@ class Bot:
             "edge": decision.edge,
             "score": decision.score,
             "opened_at": utc_now_iso(),
-            "mode": BOT_MODE,
-            "entry_order_id": fill.order_id,
+            "mode": self.effective_mode,
+            "entry_order_id": order_id,
             "entry_order_status": fill.status,
             "last_response": fill.raw_response,
             "realized_pnl_usd": 0.0,
+            "unrealized_pnl_usd": 0.0,
+            "current_probability": fill.avg_price,
+            "current_value_usd": current_value_usd,
+            "requested_mode": self.requested_mode,
+            "effective_mode": self.effective_mode,
         }
         self.positions[market_id] = position
         self.save_state()
 
-        append_jsonl(
-            TRADES_FILE,
-            {
-                "timestamp": utc_now_iso(),
-                "type": f"{BOT_MODE}_entry",
-                "position": position,
-                "reason": decision.reason,
-                "signal_type": decision.signal_type,
-                "urgency": decision.urgency,
-                "fill": fill.raw_response,
-            },
-        )
+        try:
+            with get_db() as conn:
+                repo.upsert_order(
+                    conn,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=fill.order_id,
+                    position_id=position["position_id"],
+                    market_id=market_id,
+                    condition_id=condition_id,
+                    token_id=token_id,
+                    side="BUY",
+                    execution_mode="direct_execution",
+                    status=fill.status or "filled",
+                    requested_mode=self.requested_mode,
+                    effective_mode=self.effective_mode,
+                    requested_price=decision.probability,
+                    executed_price=fill.avg_price,
+                    requested_value_usd=size_usd,
+                    executed_value_usd=fill.filled_value_usd,
+                    requested_shares=requested_shares,
+                    filled_shares=fill.filled_shares,
+                    remaining_shares=max(requested_shares - fill.filled_shares, 0.0),
+                    fallback_reason=decision.reason,
+                    metadata={"response": fill.raw_response, "signal_type": decision.signal_type, "urgency": decision.urgency},
+                )
+                repo.upsert_position(
+                    conn, position,
+                    requested_mode=self.requested_mode,
+                    effective_mode=self.effective_mode,
+                )
+                repo.insert_trade_event(
+                    conn,
+                    action_type="buy_submitted",
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=fill.order_id,
+                    position_id=position["position_id"],
+                    market_id=market_id,
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    status="submitted",
+                    requested_mode=self.requested_mode,
+                    effective_mode=self.effective_mode,
+                    execution_mode="direct_execution",
+                    requested_price=decision.probability,
+                    requested_value_usd=size_usd,
+                    requested_shares=requested_shares,
+                    reason=decision.reason,
+                    metadata={"signal_type": decision.signal_type, "urgency": decision.urgency},
+                )
+                repo.insert_trade_event(
+                    conn,
+                    action_type="buy_filled",
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=fill.order_id,
+                    position_id=position["position_id"],
+                    market_id=market_id,
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    status=fill.status or "filled",
+                    requested_mode=self.requested_mode,
+                    effective_mode=self.effective_mode,
+                    execution_mode="direct_execution",
+                    requested_price=decision.probability,
+                    executed_price=fill.avg_price,
+                    requested_value_usd=size_usd,
+                    executed_value_usd=fill.filled_value_usd,
+                    requested_shares=requested_shares,
+                    filled_shares=fill.filled_shares,
+                    remaining_shares=max(requested_shares - fill.filled_shares, 0.0),
+                    reason=decision.reason,
+                    metadata={"signal_type": decision.signal_type, "urgency": decision.urgency},
+                )
+                repo.debit_account_on_entry(conn, ACCOUNT_KEY, fill.filled_value_usd)
+            self.refresh_account_state_from_db()
+        except Exception as exc:
+            logger.warning("DB write failed (buy_filled): %s", exc)
 
     def current_position_probability(self, position: dict[str, Any], market: dict[str, Any]) -> float:
         side = str(position.get("side", "YES"))
@@ -1356,9 +1872,21 @@ class Bot:
             return False
         return new_side != position.get("side") and confidence >= MIN_CONFIDENCE
 
-    def close_position(self, market_id: str, position: dict[str, Any], exit_reason: str, current_prob: float) -> None:
-        self.assert_runtime_safety("pre-exit")
+    def close_position(
+        self,
+        market_id: str,
+        position: dict[str, Any],
+        exit_reason: str,
+        current_prob: float,
+        *,
+        parent_order_id: str | None = None,
+        replacement_context: dict[str, Any] | None = None,
+        skip_safety_check: bool = False,
+    ) -> None:
+        if not skip_safety_check:
+            self.assert_runtime_safety("pre-exit")
         existing_pending = self.pending_exit_order_for_market(market_id)
+        client_order_id = f"exit-{uuid.uuid4()}"
         if existing_pending:
             pending_order_id, pending = existing_pending
             logger.info(
@@ -1392,28 +1920,114 @@ class Bot:
             },
         )
         if self.response_indicates_ban_risk(response):
-            raise SafetyShutdown(f"pre-exit: Polymarket response indicates compliance/geoblock risk; terminating: {response}")
+            self.enter_live_protection("compliance_or_geoblock", "pre_exit_response")
+            return
         fill = parse_fill_result(
             response=response,
             fallback_price=limit_price,
             requested_value_usd=round(shares * limit_price, 6),
             requested_shares=shares,
         )
+        order_id = fill.order_id or client_order_id
+        requested_value_usd = round(shares * limit_price, 6)
         if not fill.success:
             logger.warning("Exit order for %s returned no fill: %s", market_id, response)
-            append_jsonl(
-                TRADES_FILE,
-                {
-                    "timestamp": utc_now_iso(),
-                    "type": f"{BOT_MODE}_exit_rejected",
-                    "market_id": market_id,
-                    "token_id": position["token_id"],
-                    "response": response,
-                    "exit_reason": exit_reason,
-                },
-            )
+            try:
+                with get_db() as conn:
+                    repo.upsert_order(
+                        conn,
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=fill.order_id,
+                        parent_order_id=parent_order_id,
+                        position_id=position.get("position_id"),
+                        market_id=market_id,
+                        condition_id=position.get("condition_id"),
+                        token_id=position["token_id"],
+                        side="SELL",
+                        execution_mode="quoted_execution",
+                        status=fill.status or "rejected",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        requested_price=limit_price,
+                        requested_value_usd=requested_value_usd,
+                        requested_shares=shares,
+                        filled_shares=fill.filled_shares,
+                        executed_value_usd=fill.filled_value_usd,
+                        remaining_shares=max(shares - fill.filled_shares, 0.0),
+                        fallback_reason=exit_reason,
+                        metadata={"response": response, "exit_reason": exit_reason},
+                    )
+                    repo.insert_trade_event(
+                        conn,
+                        action_type="quote_submitted",
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=fill.order_id,
+                        parent_order_id=parent_order_id,
+                        position_id=position.get("position_id"),
+                        market_id=market_id,
+                        token_id=position["token_id"],
+                        condition_id=position.get("condition_id"),
+                        status="submitted",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        execution_mode="quoted_execution",
+                        requested_price=limit_price,
+                        requested_value_usd=requested_value_usd,
+                        requested_shares=shares,
+                        reason=exit_reason,
+                    )
+                    repo.insert_trade_event(
+                        conn,
+                        action_type="sell_submitted",
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=fill.order_id,
+                        parent_order_id=parent_order_id,
+                        position_id=position.get("position_id"),
+                        market_id=market_id,
+                        token_id=position["token_id"],
+                        condition_id=position.get("condition_id"),
+                        status="submitted",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        execution_mode="quoted_execution",
+                        requested_price=limit_price,
+                        requested_value_usd=requested_value_usd,
+                        requested_shares=shares,
+                        reason=exit_reason,
+                    )
+                    repo.insert_trade_event(
+                        conn,
+                        action_type="rejected",
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=fill.order_id,
+                        position_id=position.get("position_id"),
+                        market_id=market_id,
+                        token_id=position["token_id"],
+                        condition_id=position.get("condition_id"),
+                        status=fill.status or "rejected",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        execution_mode="quoted_execution",
+                        requested_price=limit_price,
+                        requested_value_usd=requested_value_usd,
+                        requested_shares=shares,
+                        filled_shares=fill.filled_shares,
+                        remaining_shares=max(shares - fill.filled_shares, 0.0),
+                        reason=exit_reason,
+                        metadata={"response": response},
+                    )
+            except Exception as exc:
+                logger.warning("DB write failed (exit_rejected): %s", exc)
+            fallback_reason = self.response_indicates_live_unavailable(response)
+            if fallback_reason:
+                self.enter_live_protection(fallback_reason, "exit_rejected")
             return
 
+        position_id = position.get("position_id")
         closed, updated_position = self.apply_exit_fill_to_position(
             market_id=market_id,
             position=position,
@@ -1425,46 +2039,277 @@ class Bot:
             order_id=fill.order_id,
         )
 
-        if updated_position and fill.order_id and fill.status in {"live", "open", "matched", "partially_filled", "partially_matched"}:
-            self.pending_orders[fill.order_id] = {
+        pending_order: dict[str, Any] | None = None
+        if updated_position and order_id and fill.status in {"live", "open", "matched", "partially_filled", "partially_matched"}:
+            pending_order = {
                 "market_id": market_id,
                 "token_id": position["token_id"],
                 "condition_id": position.get("condition_id"),
+                "position_id": position_id,
                 "side": "SELL",
                 "exit_reason": exit_reason,
-                "order_id": fill.order_id,
+                "order_id": order_id,
                 "created_at": utc_now_iso(),
                 "last_checked_at": utc_now_iso(),
                 "initial_shares": shares,
+                "filled_shares": fill.filled_shares,
                 "remaining_shares": current_position_shares(updated_position),
                 "limit_price": limit_price,
+                "executed_value_usd": round(fill.filled_shares * fill.avg_price, 6),
+                "parent_order_id": parent_order_id,
+                "root_order_id": parent_order_id or order_id,
             }
+            self.pending_orders[order_id] = pending_order
 
         self.save_state()
-        append_jsonl(
-            TRADES_FILE,
-            {
-                "timestamp": utc_now_iso(),
-                "type": f"{BOT_MODE}_exit",
-                "position": closed,
-                "fill": fill.raw_response,
-            },
-        )
+
+        try:
+            with get_db() as conn:
+                repo.upsert_order(
+                    conn,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=fill.order_id,
+                    parent_order_id=parent_order_id,
+                    position_id=position_id,
+                    market_id=market_id,
+                    condition_id=position.get("condition_id"),
+                    token_id=position["token_id"],
+                    side="SELL",
+                    execution_mode="quoted_execution",
+                    status="open" if pending_order is not None else (fill.status or "filled"),
+                    requested_mode=self.requested_mode,
+                    effective_mode=self.effective_mode,
+                    requested_price=limit_price,
+                    executed_price=fill.avg_price,
+                    requested_value_usd=requested_value_usd,
+                    executed_value_usd=fill.filled_shares * fill.avg_price,
+                    requested_shares=shares,
+                    filled_shares=fill.filled_shares,
+                    remaining_shares=current_position_shares(updated_position) if updated_position else 0.0,
+                    fallback_reason=exit_reason,
+                    metadata=(pending_order or {"response": fill.raw_response, "exit_reason": exit_reason}),
+                )
+                repo.insert_trade_event(
+                    conn,
+                    action_type="quote_submitted",
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=fill.order_id,
+                    parent_order_id=parent_order_id,
+                    position_id=position_id,
+                    market_id=market_id,
+                    token_id=position["token_id"],
+                    condition_id=position.get("condition_id"),
+                    status="submitted",
+                    requested_mode=self.requested_mode,
+                    effective_mode=self.effective_mode,
+                    execution_mode="quoted_execution",
+                    requested_price=limit_price,
+                    requested_value_usd=requested_value_usd,
+                    requested_shares=shares,
+                    reason=exit_reason,
+                )
+                repo.insert_trade_event(
+                    conn,
+                    action_type="sell_submitted",
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=fill.order_id,
+                    parent_order_id=parent_order_id,
+                    position_id=position_id,
+                    market_id=market_id,
+                    token_id=position["token_id"],
+                    condition_id=position.get("condition_id"),
+                    status="submitted",
+                    requested_mode=self.requested_mode,
+                    effective_mode=self.effective_mode,
+                    execution_mode="quoted_execution",
+                    requested_price=limit_price,
+                    requested_value_usd=requested_value_usd,
+                    requested_shares=shares,
+                    reason=exit_reason,
+                )
+                if parent_order_id and replacement_context:
+                    previous_shares = as_float(replacement_context.get("previous_requested_shares"))
+                    if previous_shares > 0 and abs(previous_shares - shares) > 1e-6:
+                        repo.insert_trade_event(
+                            conn,
+                            action_type="amount_modified",
+                            order_id=order_id,
+                            client_order_id=client_order_id,
+                            venue_order_id=fill.order_id,
+                            parent_order_id=parent_order_id,
+                            position_id=position_id,
+                            market_id=market_id,
+                            token_id=position["token_id"],
+                            condition_id=position.get("condition_id"),
+                            status="amount_modified",
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                            execution_mode="quoted_execution",
+                            requested_price=limit_price,
+                            requested_value_usd=requested_value_usd,
+                            requested_shares=shares,
+                            remaining_shares=current_position_shares(updated_position) if updated_position else 0.0,
+                            reason=exit_reason,
+                            metadata={
+                                "replaced_order_id": parent_order_id,
+                                "previous_requested_shares": previous_shares,
+                            },
+                        )
+                    repo.insert_trade_event(
+                        conn,
+                        action_type="repriced",
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=fill.order_id,
+                        parent_order_id=parent_order_id,
+                        position_id=position_id,
+                        market_id=market_id,
+                        token_id=position["token_id"],
+                        condition_id=position.get("condition_id"),
+                        status="repriced",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        execution_mode="quoted_execution",
+                        requested_price=limit_price,
+                        requested_value_usd=requested_value_usd,
+                        requested_shares=shares,
+                        remaining_shares=current_position_shares(updated_position) if updated_position else 0.0,
+                        reason=exit_reason,
+                        metadata={
+                            "replaced_order_id": parent_order_id,
+                            "previous_price": replacement_context.get("previous_price"),
+                        },
+                    )
+                if updated_position is None:
+                    repo.close_position_in_db(
+                        conn, position_id,
+                        closed.get("total_realized_pnl_usd", 0),
+                    )
+                else:
+                    repo.upsert_position(
+                        conn, updated_position,
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                    )
+                repo.credit_account_on_exit(
+                    conn,
+                    ACCOUNT_KEY,
+                    position_cost_basis_usd(position, fill.filled_shares),
+                    fill.filled_shares * fill.avg_price,
+                    closed.get("realized_pnl_usd_estimate", 0),
+                )
+                if pending_order is not None:
+                    repo.upsert_pending_order(
+                        conn, pending_order,
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                    )
+                repo.insert_trade_event(
+                    conn,
+                    action_type="sell_filled" if updated_position is None else "partial_fill",
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=fill.order_id,
+                    position_id=position_id,
+                    market_id=market_id,
+                    token_id=position["token_id"],
+                    condition_id=position.get("condition_id"),
+                    status=fill.status or ("filled" if updated_position is None else "partially_filled"),
+                    requested_mode=self.requested_mode,
+                    effective_mode=self.effective_mode,
+                    execution_mode="quoted_execution",
+                    requested_price=limit_price,
+                    executed_price=fill.avg_price,
+                    executed_value_usd=fill.filled_shares * fill.avg_price,
+                    requested_value_usd=requested_value_usd,
+                    requested_shares=shares,
+                    filled_shares=fill.filled_shares,
+                    remaining_shares=(
+                        current_position_shares(updated_position) if updated_position else 0.0
+                    ),
+                    reason=exit_reason,
+                )
+                if pending_order is not None:
+                    repo.insert_trade_event(
+                        conn,
+                        action_type="pending",
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=fill.order_id,
+                        position_id=position_id,
+                        market_id=market_id,
+                        token_id=position["token_id"],
+                        condition_id=position.get("condition_id"),
+                        status="open",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        execution_mode="quoted_execution",
+                        requested_price=limit_price,
+                        requested_value_usd=requested_value_usd,
+                        requested_shares=shares,
+                        filled_shares=fill.filled_shares,
+                        remaining_shares=current_position_shares(updated_position),
+                        reason=exit_reason,
+                    )
+                else:
+                    repo.insert_trade_event(
+                        conn,
+                        action_type="position_closed",
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=fill.order_id,
+                        position_id=position_id,
+                        market_id=market_id,
+                        token_id=position["token_id"],
+                        condition_id=position.get("condition_id"),
+                        status="closed",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        execution_mode="quoted_execution",
+                        executed_price=fill.avg_price,
+                        executed_value_usd=fill.filled_shares * fill.avg_price,
+                        filled_shares=fill.filled_shares,
+                        remaining_shares=0.0,
+                        reason=exit_reason,
+                        metadata={"total_realized_pnl_usd": closed.get("total_realized_pnl_usd", 0)},
+                    )
+        except Exception as exc:
+            logger.warning("DB write failed (close_position): %s", exc)
+        self.sync_account_market_state(refresh_prices=False)
 
     def monitor_positions(self) -> None:
+        if self.positions:
+            self.sync_account_market_state(refresh_prices=True)
         for market_id, position in list(self.positions.items()):
             try:
                 if self.pending_exit_order_for_market(market_id):
                     continue
-                current_prob = self.latest_position_probability(position)
-                exit_reason, current_prob = self.should_exit_position(
-                    position,
-                    {"yesPrice": current_prob, "noPrice": current_prob},
+                current_prob = as_float(
+                    position.get("current_probability"),
+                    self.latest_position_probability(position),
                 )
-                if not exit_reason and self.reversed_signal_detected(position):
-                    exit_reason = "signal_reversal"
+                if self.protection_mode_reason:
+                    exit_reason = "live_protection_exit"
+                else:
+                    exit_reason, current_prob = self.should_exit_position(
+                        position,
+                        {"yesPrice": current_prob, "noPrice": current_prob},
+                    )
+                    if not exit_reason and self.reversed_signal_detected(position):
+                        exit_reason = "signal_reversal"
                 if exit_reason:
-                    self.close_position(market_id, position, exit_reason, current_prob)
+                    self.close_position(
+                        market_id,
+                        position,
+                        exit_reason,
+                        current_prob,
+                        skip_safety_check=(exit_reason == "live_protection_exit"),
+                    )
+            except SafetyShutdown:
+                raise
             except Exception as exc:
                 logger.exception("Position monitor error for %s: %s", market_id, exc)
 
@@ -1486,15 +2331,25 @@ class Bot:
                     self.user_stream.pop_order_event(order_id)
                 status_response = self.trader.get_order_status(order_id)
                 if self.response_indicates_ban_risk(status_response):
-                    raise SafetyShutdown(
-                        f"pending-order:{order_id}: Polymarket response indicates compliance/geoblock risk; terminating: {status_response}"
-                    )
+                    self.enter_live_protection("compliance_or_geoblock", f"pending_order:{order_id}")
+                    continue
                 fallback_price = as_float(pending.get("limit_price"), as_float(position.get("entry_probability"), 0.5))
                 status = parse_order_status(status_response, fallback_price=fallback_price)
                 pending["last_checked_at"] = utc_now_iso()
 
+                initial_shares = as_float(pending.get("initial_shares"))
                 previously_remaining = as_float(pending.get("remaining_shares"), current_position_shares(position))
                 newly_filled = round(max(previously_remaining - status.remaining_shares, 0.0), 6)
+                cumulative_filled_shares = max(initial_shares - status.remaining_shares, 0.0)
+                cumulative_executed_value = cumulative_executed_value_usd(
+                    initial_shares,
+                    status.remaining_shares,
+                    status.avg_price,
+                )
+                pending["filled_shares"] = cumulative_filled_shares
+                pending["executed_value_usd"] = cumulative_executed_value
+
+                pos_position_id = position.get("position_id") if position else None
 
                 if newly_filled > 0:
                     closed, updated_position = self.apply_exit_fill_to_position(
@@ -1507,19 +2362,107 @@ class Bot:
                         order_status=status.status,
                         order_id=status.order_id,
                     )
-                    append_jsonl(
-                        TRADES_FILE,
-                        {
-                            "timestamp": utc_now_iso(),
-                            "type": f"{BOT_MODE}_exit_fill_update",
-                            "position": closed,
-                            "fill": status.raw_response,
-                        },
-                    )
+                    try:
+                        with get_db() as conn:
+                            repo.upsert_order(
+                                conn,
+                                order_id=order_id,
+                                position_id=pos_position_id,
+                                market_id=market_id,
+                                condition_id=pending.get("condition_id"),
+                                token_id=str(pending.get("token_id", "")),
+                                side="SELL",
+                                execution_mode="quoted_execution",
+                                status=status.status or "open",
+                                requested_mode=self.requested_mode,
+                                effective_mode=self.effective_mode,
+                                requested_price=as_float(pending.get("limit_price")),
+                                executed_price=status.avg_price,
+                                requested_value_usd=round(
+                                    initial_shares * as_float(pending.get("limit_price")),
+                                    6,
+                                ),
+                                executed_value_usd=cumulative_executed_value,
+                                requested_shares=initial_shares,
+                                filled_shares=cumulative_filled_shares,
+                                remaining_shares=status.remaining_shares,
+                                fallback_reason=str(pending.get("exit_reason", "pending_exit_fill")),
+                                metadata={**pending, "last_status": status.raw_response},
+                            )
+                            if updated_position is None:
+                                repo.close_position_in_db(
+                                    conn, pos_position_id,
+                                    closed.get("total_realized_pnl_usd", 0),
+                                )
+                            else:
+                                repo.upsert_position(
+                                    conn, updated_position,
+                                    requested_mode=self.requested_mode,
+                                    effective_mode=self.effective_mode,
+                                )
+                            repo.credit_account_on_exit(
+                                conn,
+                                ACCOUNT_KEY,
+                                position_cost_basis_usd(position, newly_filled),
+                                newly_filled * status.avg_price,
+                                closed.get("realized_pnl_usd_estimate", 0),
+                            )
+                            repo.insert_trade_event(
+                                conn,
+                                action_type="sell_filled" if updated_position is None else "partial_fill",
+                                order_id=order_id,
+                                position_id=pos_position_id,
+                                market_id=market_id,
+                                token_id=str(pending.get("token_id", "")),
+                                condition_id=pending.get("condition_id"),
+                                status=status.status,
+                                requested_mode=self.requested_mode,
+                                effective_mode=self.effective_mode,
+                                execution_mode="quoted_execution",
+                                requested_price=as_float(pending.get("limit_price")),
+                                executed_price=status.avg_price,
+                                executed_value_usd=newly_filled * status.avg_price,
+                                requested_value_usd=round(
+                                    initial_shares * as_float(pending.get("limit_price")),
+                                    6,
+                                ),
+                                requested_shares=initial_shares,
+                                filled_shares=newly_filled,
+                                remaining_shares=status.remaining_shares,
+                                reason=str(pending.get("exit_reason", "pending_exit_fill")),
+                            )
+                            if updated_position is None:
+                                repo.insert_trade_event(
+                                    conn,
+                                    action_type="position_closed",
+                                    order_id=order_id,
+                                    position_id=pos_position_id,
+                                    market_id=market_id,
+                                    token_id=str(pending.get("token_id", "")),
+                                    condition_id=pending.get("condition_id"),
+                                    status="closed",
+                                    requested_mode=self.requested_mode,
+                                    effective_mode=self.effective_mode,
+                                    execution_mode="quoted_execution",
+                                    executed_price=status.avg_price,
+                                    executed_value_usd=newly_filled * status.avg_price,
+                                    filled_shares=newly_filled,
+                                    remaining_shares=0.0,
+                                    reason=str(pending.get("exit_reason", "pending_exit_fill")),
+                                    metadata={"total_realized_pnl_usd": closed.get("total_realized_pnl_usd", 0)},
+                                )
+                    except Exception as exc:
+                        logger.warning("DB write failed (exit_fill_update): %s", exc)
                     position = updated_position
+                    self.sync_account_market_state(refresh_prices=False, persist_positions=False)
 
                 if status.remaining_shares <= 0 or status.is_terminal and status.status in {"filled", "cancelled", "canceled", "expired"}:
                     self.pending_orders.pop(order_id, None)
+                    try:
+                        with get_db() as conn:
+                            repo.close_order_in_db(conn, order_id, status.status)
+                    except Exception as exc:
+                        logger.warning("DB write failed (close_order terminal): %s", exc)
                     self.save_state()
                     continue
 
@@ -1528,18 +2471,95 @@ class Bot:
                 age_seconds = (now - created_at).total_seconds()
 
                 if EXIT_ORDER_REPRICE and age_seconds >= EXIT_ORDER_TIMEOUT_SECONDS:
+                    try:
+                        with get_db() as conn:
+                            repo.insert_trade_event(
+                                conn,
+                                action_type="quote_expired",
+                                order_id=order_id,
+                                position_id=pos_position_id,
+                                market_id=market_id,
+                                token_id=str(pending.get("token_id", "")),
+                                condition_id=pending.get("condition_id"),
+                                status="expired",
+                                requested_mode=self.requested_mode,
+                                effective_mode=self.effective_mode,
+                                execution_mode="quoted_execution",
+                                requested_price=as_float(pending.get("limit_price")),
+                                requested_value_usd=round(
+                                    initial_shares * as_float(pending.get("limit_price")),
+                                    6,
+                                ),
+                                requested_shares=initial_shares,
+                                remaining_shares=status.remaining_shares,
+                                reason="exit_quote_timeout",
+                            )
+                            repo.insert_trade_event(
+                                conn,
+                                action_type="cancel_requested",
+                                order_id=order_id,
+                                position_id=pos_position_id,
+                                market_id=market_id,
+                                token_id=str(pending.get("token_id", "")),
+                                condition_id=pending.get("condition_id"),
+                                status="cancel_requested",
+                                requested_mode=self.requested_mode,
+                                effective_mode=self.effective_mode,
+                                execution_mode="quoted_execution",
+                                requested_price=as_float(pending.get("limit_price")),
+                                requested_value_usd=round(
+                                    initial_shares * as_float(pending.get("limit_price")),
+                                    6,
+                                ),
+                                requested_shares=initial_shares,
+                                remaining_shares=status.remaining_shares,
+                                reason="exit_cancel_reprice",
+                            )
+                    except Exception as exc:
+                        logger.warning("DB write failed (pre_cancel_reprice): %s", exc)
+
                     cancel_response = self.trader.cancel_order(order_id)
-                    append_jsonl(
-                        TRADES_FILE,
-                        {
-                            "timestamp": utc_now_iso(),
-                            "type": f"{BOT_MODE}_exit_cancel_reprice",
-                            "market_id": market_id,
-                            "order_id": order_id,
-                            "cancel_response": cancel_response,
-                        },
-                    )
                     self.pending_orders.pop(order_id, None)
+                    try:
+                        with get_db() as conn:
+                            repo.close_order_in_db(conn, order_id, "canceled")
+                            repo.insert_trade_event(
+                                conn,
+                                action_type="canceled",
+                                order_id=order_id,
+                                position_id=pos_position_id,
+                                market_id=market_id,
+                                token_id=str(pending.get("token_id", "")),
+                                condition_id=pending.get("condition_id"),
+                                requested_mode=self.requested_mode,
+                                effective_mode=self.effective_mode,
+                                reason="exit_cancel_reprice",
+                                metadata={"cancel_response": cancel_response},
+                            )
+                            repo.insert_trade_event(
+                                conn,
+                                action_type="reprice_requested",
+                                order_id=order_id,
+                                position_id=pos_position_id,
+                                market_id=market_id,
+                                token_id=str(pending.get("token_id", "")),
+                                condition_id=pending.get("condition_id"),
+                                status="reprice_requested",
+                                requested_mode=self.requested_mode,
+                                effective_mode=self.effective_mode,
+                                execution_mode="quoted_execution",
+                                requested_price=as_float(pending.get("limit_price")),
+                                requested_value_usd=round(
+                                    initial_shares * as_float(pending.get("limit_price")),
+                                    6,
+                                ),
+                                requested_shares=initial_shares,
+                                remaining_shares=status.remaining_shares,
+                                reason="exit_cancel_reprice",
+                                metadata={"cancel_response": cancel_response},
+                            )
+                    except Exception as exc:
+                        logger.warning("DB write failed (cancel_reprice): %s", exc)
 
                     refreshed_position = self.positions.get(market_id)
                     if not refreshed_position:
@@ -1553,11 +2573,67 @@ class Bot:
                         position=refreshed_position,
                         exit_reason=f"{pending.get('exit_reason', 'pending_exit')}_reprice",
                         current_prob=current_prob,
+                        parent_order_id=order_id,
+                        replacement_context={
+                            "previous_requested_shares": pending.get("initial_shares"),
+                            "previous_price": pending.get("limit_price"),
+                        },
                     )
                     self.save_state()
                     continue
 
                 self.pending_orders[order_id] = pending
+                try:
+                    with get_db() as conn:
+                        repo.upsert_order(
+                            conn,
+                            order_id=order_id,
+                            position_id=pos_position_id,
+                            market_id=market_id,
+                            condition_id=pending.get("condition_id"),
+                            token_id=str(pending.get("token_id", "")),
+                            side="SELL",
+                            execution_mode="quoted_execution",
+                            status=status.status or "open",
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                            requested_price=as_float(pending.get("limit_price")),
+                            executed_price=status.avg_price,
+                            requested_value_usd=round(
+                                initial_shares * as_float(pending.get("limit_price")),
+                                6,
+                            ),
+                            executed_value_usd=cumulative_executed_value,
+                            requested_shares=initial_shares,
+                            filled_shares=cumulative_filled_shares,
+                            remaining_shares=status.remaining_shares,
+                            fallback_reason=str(pending.get("exit_reason", "pending_exit")),
+                            metadata={**pending, "last_status": status.raw_response},
+                        )
+                        repo.insert_trade_event(
+                            conn,
+                            action_type="pending",
+                            order_id=order_id,
+                            position_id=pos_position_id,
+                            market_id=market_id,
+                            token_id=str(pending.get("token_id", "")),
+                            condition_id=pending.get("condition_id"),
+                            status=status.status,
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                            execution_mode="quoted_execution",
+                            requested_price=as_float(pending.get("limit_price")),
+                            requested_value_usd=round(
+                                initial_shares * as_float(pending.get("limit_price")),
+                                6,
+                            ),
+                            requested_shares=initial_shares,
+                            filled_shares=cumulative_filled_shares,
+                            remaining_shares=status.remaining_shares,
+                            reason=str(pending.get("exit_reason", "pending_exit")),
+                        )
+                except Exception as exc:
+                    logger.warning("DB write failed (update_remaining): %s", exc)
                 self.save_state()
             except SafetyShutdown:
                 raise
@@ -1565,7 +2641,23 @@ class Bot:
                 logger.exception("Pending order monitor error for %s: %s", order_id, exc)
 
     def reconcile_startup_state(self) -> None:
-        self.assert_live_trading_allowed()
+        if self.effective_mode == "live":
+            self.assert_live_trading_allowed()
+        else:
+            if not STARTUP_RECONCILE:
+                return
+            # Paper mode: clean up zero-share positions; skip live API calls
+            for market_id, pos in list(self.positions.items()):
+                if current_position_shares(pos) <= 0:
+                    self.positions.pop(market_id, None)
+                    try:
+                        with get_db() as conn:
+                            repo.close_position_in_db(conn, pos.get("position_id"), 0)
+                    except Exception as exc:
+                        logger.warning("DB write failed (paper startup reconcile): %s", exc)
+            self.sync_account_market_state(refresh_prices=False)
+            self.save_state()
+            return
 
         if not STARTUP_RECONCILE:
             return
@@ -1585,6 +2677,11 @@ class Bot:
             if not position:
                 logger.warning("Removing zombie pending order %s because market %s has no local position", order_id, market_id)
                 self.pending_orders.pop(order_id, None)
+                try:
+                    with get_db() as conn:
+                        repo.close_order_in_db(conn, order_id, "orphaned")
+                except Exception as exc:
+                    logger.warning("DB write failed (orphaned startup order): %s", exc)
                 changed = True
                 continue
 
@@ -1592,9 +2689,8 @@ class Bot:
                 self.assert_runtime_safety(f"startup-reconcile:{order_id}")
                 status_response = self.trader.get_order_status(order_id)
                 if self.response_indicates_ban_risk(status_response):
-                    raise SafetyShutdown(
-                        f"startup-reconcile:{order_id}: Polymarket response indicates compliance/geoblock risk; terminating: {status_response}"
-                    )
+                    self.enter_live_protection("compliance_or_geoblock", f"startup_reconcile:{order_id}")
+                    continue
                 fallback_price = as_float(pending.get("limit_price"), as_float(position.get("entry_probability"), 0.5))
                 status = parse_order_status(status_response, fallback_price=fallback_price)
             except SafetyShutdown:
@@ -1605,8 +2701,18 @@ class Bot:
 
             previously_remaining = as_float(pending.get("remaining_shares"), current_position_shares(position))
             newly_filled = round(max(previously_remaining - status.remaining_shares, 0.0), 6)
+            initial_shares = as_float(pending.get("initial_shares"))
+            cumulative_filled_shares = max(initial_shares - status.remaining_shares, 0.0)
+            cumulative_executed_value = cumulative_executed_value_usd(
+                initial_shares,
+                status.remaining_shares,
+                status.avg_price,
+            )
+            pending["filled_shares"] = cumulative_filled_shares
+            pending["executed_value_usd"] = cumulative_executed_value
 
             if newly_filled > 0:
+                pos_position_id = position.get("position_id")
                 closed, updated_position = self.apply_exit_fill_to_position(
                     market_id=market_id,
                     position=position,
@@ -1617,15 +2723,97 @@ class Bot:
                     order_status=status.status,
                     order_id=status.order_id,
                 )
-                append_jsonl(
-                    TRADES_FILE,
-                    {
-                        "timestamp": utc_now_iso(),
-                        "type": f"{BOT_MODE}_startup_reconcile_fill",
-                        "position": closed,
-                        "fill": status.raw_response,
-                    },
-                )
+                try:
+                    with get_db() as conn:
+                        repo.upsert_order(
+                            conn,
+                            order_id=order_id,
+                            position_id=pos_position_id,
+                            market_id=market_id,
+                            condition_id=pending.get("condition_id"),
+                            token_id=str(pending.get("token_id", "")),
+                            side="SELL",
+                            execution_mode="quoted_execution",
+                            status=status.status or "open",
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                            requested_price=as_float(pending.get("limit_price")),
+                            executed_price=status.avg_price,
+                            requested_value_usd=round(
+                                initial_shares * as_float(pending.get("limit_price")),
+                                6,
+                            ),
+                            executed_value_usd=cumulative_executed_value,
+                            requested_shares=initial_shares,
+                            filled_shares=cumulative_filled_shares,
+                            remaining_shares=status.remaining_shares,
+                            fallback_reason=f"{pending.get('exit_reason', 'startup_reconcile')}_startup_reconcile",
+                            metadata={**pending, "last_status": status.raw_response},
+                        )
+                        if updated_position is None:
+                            repo.close_position_in_db(
+                                conn, pos_position_id,
+                                closed.get("total_realized_pnl_usd", 0),
+                            )
+                        else:
+                            repo.upsert_position(
+                                conn, updated_position,
+                                requested_mode=self.requested_mode,
+                                effective_mode=self.effective_mode,
+                            )
+                        repo.credit_account_on_exit(
+                            conn,
+                            ACCOUNT_KEY,
+                            position_cost_basis_usd(position, newly_filled),
+                            newly_filled * status.avg_price,
+                            closed.get("realized_pnl_usd_estimate", 0),
+                        )
+                        repo.insert_trade_event(
+                            conn,
+                            action_type="sell_filled" if updated_position is None else "partial_fill",
+                            order_id=order_id,
+                            position_id=pos_position_id,
+                            market_id=market_id,
+                            token_id=str(pending.get("token_id", "")),
+                            condition_id=pending.get("condition_id"),
+                            status=status.status,
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                            execution_mode="quoted_execution",
+                            requested_price=as_float(pending.get("limit_price")),
+                            executed_price=status.avg_price,
+                            executed_value_usd=newly_filled * status.avg_price,
+                            requested_value_usd=round(
+                                initial_shares * as_float(pending.get("limit_price")),
+                                6,
+                            ),
+                            requested_shares=initial_shares,
+                            filled_shares=newly_filled,
+                            remaining_shares=status.remaining_shares,
+                            reason=f"{pending.get('exit_reason', 'startup_reconcile')}_startup_reconcile",
+                        )
+                        if updated_position is None:
+                            repo.insert_trade_event(
+                                conn,
+                                action_type="position_closed",
+                                order_id=order_id,
+                                position_id=pos_position_id,
+                                market_id=market_id,
+                                token_id=str(pending.get("token_id", "")),
+                                condition_id=pending.get("condition_id"),
+                                status="closed",
+                                requested_mode=self.requested_mode,
+                                effective_mode=self.effective_mode,
+                                execution_mode="quoted_execution",
+                                executed_price=status.avg_price,
+                                executed_value_usd=newly_filled * status.avg_price,
+                                filled_shares=newly_filled,
+                                remaining_shares=0.0,
+                                reason=f"{pending.get('exit_reason', 'startup_reconcile')}_startup_reconcile",
+                                metadata={"total_realized_pnl_usd": closed.get("total_realized_pnl_usd", 0)},
+                            )
+                except Exception as exc:
+                    logger.warning("DB write failed (startup_reconcile_fill): %s", exc)
                 position = updated_position
                 changed = True
 
@@ -1638,11 +2826,67 @@ class Bot:
             if status.remaining_shares <= 0 or status.is_terminal:
                 logger.info("Removing terminal pending order %s with status=%s", order_id, status.status)
                 self.pending_orders.pop(order_id, None)
+                try:
+                    with get_db() as conn:
+                        repo.close_order_in_db(conn, order_id, status.status)
+                except Exception as exc:
+                    logger.warning("DB write failed (terminal startup order): %s", exc)
                 changed = True
                 continue
 
             self.pending_orders[order_id]["remaining_shares"] = status.remaining_shares
             self.pending_orders[order_id]["last_checked_at"] = utc_now_iso()
+            try:
+                with get_db() as conn:
+                    repo.upsert_order(
+                        conn,
+                        order_id=order_id,
+                        position_id=position.get("position_id"),
+                        market_id=market_id,
+                        condition_id=pending.get("condition_id"),
+                        token_id=str(pending.get("token_id", "")),
+                        side="SELL",
+                        execution_mode="quoted_execution",
+                        status=status.status or "open",
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        requested_price=as_float(pending.get("limit_price")),
+                        executed_price=status.avg_price,
+                        requested_value_usd=round(
+                            initial_shares * as_float(pending.get("limit_price")),
+                            6,
+                        ),
+                        executed_value_usd=cumulative_executed_value,
+                        requested_shares=initial_shares,
+                        filled_shares=cumulative_filled_shares,
+                        remaining_shares=status.remaining_shares,
+                        fallback_reason=f"{pending.get('exit_reason', 'startup_reconcile')}_startup_reconcile",
+                        metadata={**pending, "last_status": status.raw_response},
+                    )
+                    repo.insert_trade_event(
+                        conn,
+                        action_type="pending",
+                        order_id=order_id,
+                        position_id=position.get("position_id"),
+                        market_id=market_id,
+                        token_id=str(pending.get("token_id", "")),
+                        condition_id=pending.get("condition_id"),
+                        status=status.status,
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                        execution_mode="quoted_execution",
+                        requested_price=as_float(pending.get("limit_price")),
+                        requested_value_usd=round(
+                            initial_shares * as_float(pending.get("limit_price")),
+                            6,
+                        ),
+                        requested_shares=initial_shares,
+                        filled_shares=cumulative_filled_shares,
+                        remaining_shares=status.remaining_shares,
+                        reason=f"{pending.get('exit_reason', 'startup_reconcile')}_startup_reconcile",
+                    )
+            except Exception as exc:
+                logger.warning("DB write failed (startup pending update): %s", exc)
             changed = True
 
         pending_market_ids = {str(pending.get("market_id")) for pending in self.pending_orders.values()}
@@ -1659,6 +2903,7 @@ class Bot:
 
         if changed:
             self.save_state()
+        self.sync_account_market_state(refresh_prices=bool(self.positions))
 
     def handle_feed_item(self, item: dict[str, Any]) -> None:
         event_id = item.get("event_id")
@@ -1678,7 +2923,27 @@ class Bot:
             return
         self.execute_trade(decision)
 
+    def _handle_sigterm(self, signum: int, frame: Any) -> None:
+        logger.info("SIGTERM received — initiating clean shutdown")
+        self._shutdown_requested = True
+
+    def _shutdown(self, reason: str = "normal") -> None:
+        self.persist_runtime_state(reason=reason)
+        if self.positions:
+            self.sync_account_market_state(refresh_prices=False)
+        if self.mode_run_id is not None:
+            try:
+                with get_db() as conn:
+                    repo.close_mode_run(conn, self.mode_run_id, reason[:500])
+            except Exception as exc:
+                logger.warning("Failed to close mode_run on shutdown: %s", exc)
+        try:
+            close_pool()
+        except Exception as exc:
+            logger.warning("Failed to close DB pool: %s", exc)
+
     def run(self) -> None:
+        shutdown_reason = "normal"
         try:
             try:
                 health = self.musashi.health()
@@ -1686,14 +2951,19 @@ class Bot:
             except Exception as exc:
                 logger.warning("Musashi health check failed: %s", exc)
             logger.info(
-                "Bot mode=%s bankroll=%.2f max_position=%.2f exposure_cap=%.2f",
-                BOT_MODE,
+                "Bot requested_mode=%s effective_mode=%s fallback_reason=%s "
+                "bankroll=%.2f max_position=%.2f exposure_cap=%.2f",
+                self.requested_mode,
+                self.effective_mode,
+                self.fallback_reason,
                 BANKROLL_USD,
                 MAX_POSITION_USD,
                 MAX_TOTAL_EXPOSURE_USD,
             )
             self.start_realtime_streams()
             self.reconcile_startup_state()
+            if self.positions:
+                self.sync_account_market_state(refresh_prices=False)
 
             if BOT_ENABLE_ARBITRAGE and self.arbitrage_strategy:
                 logger.info("Starting arbitrage scanner (simulation-only mode)")
@@ -1708,11 +2978,14 @@ class Bot:
                     "Arbitrage scanner disabled (set BOT_ENABLE_ARBITRAGE=true to enable)"
                 )
 
-            while True:
+            logger.info("Bot entered main loop (effective_mode=%s)", self.effective_mode)
+
+            while not self._shutdown_requested:
                 loop_started_at = time.time()
                 try:
                     self.process_pending_orders()
                     self.monitor_positions()
+                    self.evaluate_live_protection_transition()
                     feed = self.musashi.get_feed(limit=20, min_urgency="high")
                     logger.info("Fetched %d feed items", len(feed))
                     for item in feed:
@@ -1732,11 +3005,26 @@ class Bot:
                     )
                 except Exception as exc:
                     logger.exception("Loop error: %s", exc)
+                if self.mode_run_id is not None:
+                    try:
+                        with get_db() as conn:
+                            repo.update_mode_heartbeat(conn, self.mode_run_id)
+                    except Exception as exc:
+                        logger.warning("Heartbeat update failed: %s", exc)
                 self.idle_until_next_scan(loop_started_at)
+
+            shutdown_reason = "sigterm"
+
         except SafetyShutdown as exc:
             logger.critical("Safety shutdown: %s", exc)
+            shutdown_reason = f"safety_shutdown:{str(exc)[:200]}"
             raise SystemExit(1) from exc
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt — shutting down")
+            shutdown_reason = "keyboard_interrupt"
+            raise
         finally:
+            self._shutdown(reason=shutdown_reason)
             self.market_stream.stop()
             if self.user_stream:
                 self.user_stream.stop()

@@ -16,6 +16,7 @@ CREATE INDEX IF NOT EXISTS idx_mode_state_started_at
 
 CREATE TABLE IF NOT EXISTS account_state (
   account_key TEXT PRIMARY KEY,
+  initial_bankroll NUMERIC(20, 8) NOT NULL,
   requested_mode TEXT NOT NULL CHECK (requested_mode IN ('paper', 'live')),
   effective_mode TEXT NOT NULL CHECK (effective_mode IN ('paper', 'live')),
   cash_balance NUMERIC(20, 8) NOT NULL DEFAULT 0,
@@ -60,6 +61,8 @@ CREATE INDEX IF NOT EXISTS idx_positions_status
 CREATE TABLE IF NOT EXISTS orders (
   id BIGSERIAL PRIMARY KEY,
   order_id TEXT NOT NULL UNIQUE,
+  client_order_id TEXT,
+  venue_order_id TEXT,
   parent_order_id TEXT,
   position_id TEXT REFERENCES positions(position_id) ON DELETE SET NULL,
   market_id TEXT NOT NULL,
@@ -93,10 +96,19 @@ CREATE INDEX IF NOT EXISTS idx_orders_status
 CREATE INDEX IF NOT EXISTS idx_orders_created_at
   ON orders (created_at DESC);
 
+CREATE INDEX IF NOT EXISTS idx_orders_client_order_id
+  ON orders (client_order_id);
+
+CREATE INDEX IF NOT EXISTS idx_orders_venue_order_id
+  ON orders (venue_order_id);
+
 CREATE TABLE IF NOT EXISTS trade_events (
   id BIGSERIAL PRIMARY KEY,
   event_id TEXT NOT NULL UNIQUE,
   order_id TEXT REFERENCES orders(order_id) ON DELETE SET NULL,
+  client_order_id TEXT,
+  venue_order_id TEXT,
+  parent_order_id TEXT,
   position_id TEXT REFERENCES positions(position_id) ON DELETE SET NULL,
   market_id TEXT,
   condition_id TEXT,
@@ -126,6 +138,9 @@ CREATE INDEX IF NOT EXISTS idx_trade_events_action_type
 
 CREATE INDEX IF NOT EXISTS idx_trade_events_created_at
   ON trade_events (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_trade_events_position_id
+  ON trade_events (position_id);
 
 CREATE TABLE IF NOT EXISTS seen_events (
   source_event_id TEXT PRIMARY KEY,
