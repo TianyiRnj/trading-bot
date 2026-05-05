@@ -11,6 +11,15 @@ except ImportError:  # pragma: no cover - dependency is declared in requirements
         return False
 
 _pool: ConnectionPool | None = None
+REQUIRED_TABLES = (
+    "mode_state",
+    "account_state",
+    "positions",
+    "orders",
+    "trade_events",
+    "seen_events",
+    "equity_snapshots",
+)
 
 
 def _database_url() -> str | None:
@@ -56,6 +65,27 @@ def check_db_available() -> tuple[bool, str | None]:
             return False, "DATABASE_URL not set"
         with psycopg.connect(url, connect_timeout=5) as conn:
             conn.execute("SELECT 1")
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def check_db_schema_ready() -> tuple[bool, str | None]:
+    try:
+        url = _database_url()
+        if not url:
+            return False, "DATABASE_URL not set"
+        with psycopg.connect(url, connect_timeout=5) as conn:
+            missing_tables: list[str] = []
+            for table_name in REQUIRED_TABLES:
+                row = conn.execute(
+                    "SELECT to_regclass(%s)",
+                    (f"public.{table_name}",),
+                ).fetchone()
+                if row is None or row[0] is None:
+                    missing_tables.append(table_name)
+        if missing_tables:
+            return False, f"Missing required tables: {', '.join(missing_tables)}"
         return True, None
     except Exception as exc:
         return False, str(exc)

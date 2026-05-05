@@ -12,14 +12,15 @@ except ImportError:  # pragma: no cover - dependency is declared in requirements
 from flask import Flask, jsonify, render_template
 
 try:
-    from db import check_db_available, get_db, init_pool
+    from db import check_db_available, check_db_schema_ready, get_db, init_pool
     import repository as repo
 except Exception:
     try:
-        from bot.db import check_db_available, get_db, init_pool
+        from bot.db import check_db_available, check_db_schema_ready, get_db, init_pool
         import bot.repository as repo
     except Exception as exc:  # pragma: no cover - import fallback
         check_db_available = None
+        check_db_schema_ready = None
         get_db = None
         init_pool = None
         repo = None
@@ -96,7 +97,7 @@ def _compute_arbitrage_metrics(trades: list[dict[str, Any]]) -> dict[str, Any]:
 def _ensure_db_ready() -> tuple[bool, str | None]:
     if _DB_IMPORT_ERROR is not None:
         return False, str(_DB_IMPORT_ERROR)
-    if init_pool is None or check_db_available is None:
+    if init_pool is None or check_db_available is None or check_db_schema_ready is None:
         return False, "Postgres helpers are unavailable"
     try:
         init_pool(
@@ -106,7 +107,10 @@ def _ensure_db_ready() -> tuple[bool, str | None]:
         )
     except Exception as exc:
         return False, str(exc)
-    return check_db_available()
+    ready, error = check_db_available()
+    if not ready:
+        return ready, error
+    return check_db_schema_ready()
 
 
 def _load_main_dashboard_data() -> tuple[dict[str, Any], str | None]:

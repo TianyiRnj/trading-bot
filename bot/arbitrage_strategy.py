@@ -23,7 +23,7 @@ logger = logging.getLogger("arbitrage")
 MIN_SPREAD_PERCENT = 0.05   # 5% minimum spread to log an opportunity
 POSITION_SIZE_USD = 10.0    # $10 per leg (total $20 simulated exposure)
 SCAN_INTERVAL_SECONDS = 5   # seconds between API polls
-MIN_VOLUME_USD = 50000      # $50k minimum 24h volume for liquidity check
+MIN_VOLUME_USD = 500        # $500 minimum 24h volume — Kalshi political markets often report $0 24h volume
 
 _ARB_TRADES_FILE = Path(__file__).parent / "data" / "arbitrage_trades.jsonl"
 

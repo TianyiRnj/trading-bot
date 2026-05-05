@@ -80,6 +80,15 @@ python3 -c "from bot.db import check_db_available; print(check_db_available())"
 # Expected: (True, None)
 ```
 
+To verify that the required main-strategy tables already exist:
+
+```bash
+python3 -c "from bot.db import check_db_schema_ready; print(check_db_schema_ready())"
+# Expected: (True, None)
+```
+
+The bot and dashboard now refuse to start their Postgres-backed main-strategy views if the required tables are missing, so make sure `db/init/001_init.sql` has already been applied before launching them.
+
 > **Volume reset warning:** `db/init/001_init.sql` only runs automatically on a **fresh** Postgres volume. If you already have a `postgres-data` volume from a previous run and need to apply schema changes, you must destroy and recreate the volume. Only do this against a **disposable local instance** — it permanently deletes all data in that volume:
 >
 > ```bash

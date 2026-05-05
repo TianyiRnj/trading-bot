@@ -20,9 +20,11 @@ except ImportError:
     from bot.utils import utc_now_iso, parse_iso_datetime      # package: python -m bot.main
 try:
     from db import init_pool, close_pool, get_db, check_db_available   # script path
+    from db import check_db_schema_ready                                # script path
     import repository as repo                                           # script path
 except ImportError:
     from bot.db import init_pool, close_pool, get_db, check_db_available  # package path
+    from bot.db import check_db_schema_ready                              # package path
     import bot.repository as repo                                          # package path
 
 load_dotenv()
@@ -759,6 +761,10 @@ class PaperTrader:
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         return {"success": True, "canceled": [order_id]}
 
+    def check_entry_liquidity(self, token_id: str, size_usd: float) -> bool:  # noqa: ARG002
+        # Paper mode has no real order book — always allow entry.
+        return True
+
 
 class LiveTrader:
     def __init__(self) -> None:
@@ -797,6 +803,25 @@ class LiveTrader:
         except Exception as exc:
             logger.warning("Failed to fetch SELL quote for %s: %s", token_id, exc)
         return clamp_price(fallback_probability)
+
+    def check_entry_liquidity(self, token_id: str, size_usd: float) -> bool:  # noqa: ARG002
+        # get_price returns the best ask, or None when the order book has no sellers.
+        # A None result means even a small FOK order would find no counterparty, so
+        # we skip rather than move the price significantly on entry.
+        try:
+            quoted = self._client.get_price(token_id, side="BUY")
+            if quoted is None:
+                logger.warning(
+                    "[liquidity] No BUY price for token %s — order book empty, skipping entry",
+                    token_id,
+                )
+                return False
+            return True
+        except Exception as exc:
+            # Fail open: if the price check errors, allow the entry rather than
+            # silently blocking all live trades.
+            logger.warning("[liquidity] Could not fetch BUY price for %s: %s — allowing entry", token_id, exc)
+            return True
 
     def place_market_buy(self, token_id: str, amount_usd: float, meta: dict[str, Any]) -> dict[str, Any]:
         from py_clob_client.clob_types import MarketOrderArgs
@@ -974,6 +999,10 @@ class Bot:
         if not ok:
             logger.critical("Database not available: %s", error)
             raise SystemExit(1)
+        ok, error = check_db_schema_ready()
+        if not ok:
+            logger.critical("Database schema not ready: %s", error)
+            raise SystemExit(1)
 
         if self.effective_mode == "paper":
             try:
@@ -1011,7 +1040,8 @@ class Bot:
                     effective_mode=self.effective_mode,
                 )
         except Exception as exc:
-            logger.warning("DB setup writes failed (mode_run / account_state): %s", exc)
+            logger.critical("DB setup writes failed (mode_run / account_state): %s", exc)
+            raise SystemExit(1) from exc
 
         try:
             with get_db() as conn:
@@ -1020,26 +1050,12 @@ class Bot:
                 self.seen_event_ids = repo.load_seen_events(conn)
                 self.account_state = repo.get_account_state(conn, ACCOUNT_KEY) or {}
         except Exception as exc:
-            logger.warning("Failed to load state from DB: %s — starting with empty state", exc)
-            self.positions = {}
-            self.pending_orders = {}
-            self.seen_event_ids = set()
-            self.account_state = {}
+            logger.critical("Failed to load state from DB: %s", exc)
+            raise SystemExit(1) from exc
 
         if not self.account_state:
-            self.account_state = {
-                "account_key": ACCOUNT_KEY,
-                "initial_bankroll": BANKROLL_USD,
-                "requested_mode": self.requested_mode,
-                "effective_mode": self.effective_mode,
-                "cash_balance": BANKROLL_USD,
-                "positions_value": 0.0,
-                "realized_pnl": 0.0,
-                "unrealized_pnl": 0.0,
-                "equity": BANKROLL_USD,
-                "max_equity": BANKROLL_USD,
-                "drawdown": 0.0,
-            }
+            logger.critical("account_state is missing after DB initialization")
+            raise SystemExit(1)
 
         logger.info(
             "Bot requested_mode=%s effective_mode=%s fallback_reason=%s "
@@ -1071,6 +1087,21 @@ class Bot:
             )
 
         signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+    def _db_write_critical(self, label: str, exc: Exception) -> None:
+        """Handle a failed DB write on a path where data loss is unrecoverable.
+
+        In live mode the position state in Postgres is now inconsistent with
+        reality, so we raise SafetyShutdown to force a clean restart rather
+        than let the bot continue with phantom or missing positions.
+        In paper mode there is no real money at risk, so we log and continue.
+        """
+        if self.effective_mode == "live":
+            raise SafetyShutdown(
+                f"Critical DB write failed ({label}) in live mode — "
+                f"position state is inconsistent; terminating for safety: {exc}"
+            ) from exc
+        logger.error("DB write failed (%s) [paper mode — continuing]: %s", label, exc)
 
     def current_exposure(self) -> float:
         return round(
@@ -1566,9 +1597,7 @@ class Bot:
         }
 
         updated_position = None
-        if remaining_shares <= 0:
-            self.positions.pop(market_id, None)
-        else:
+        if remaining_shares > 0:
             updated_position = {
                 **position,
                 "shares": remaining_shares,
@@ -1583,8 +1612,8 @@ class Bot:
                     6,
                 ),
             }
-            self.positions[market_id] = updated_position
-
+        # Callers are responsible for applying self.positions mutations so that the
+        # in-memory removal/update only happens after any critical DB writes succeed.
         return closed_event, updated_position
 
     def already_holding(self, market_id: str, event_id: str) -> bool:
@@ -1594,10 +1623,18 @@ class Bot:
             return False
         return any(position.get("event_id") == event_id for position in self.positions.values())
 
-    def execute_trade(self, decision: Decision) -> None:
+    def execute_trade(self, decision: Decision) -> bool:
+        """Place a trade for *decision*.
+
+        Returns True for every terminal outcome (trade placed, explicitly skipped,
+        entry rejected) so the caller can mark the feed event as permanently seen.
+        Returns False only for *transient* failures — currently the single case of
+        insufficient order-book liquidity — so the caller can leave the event unseen
+        and retry it on the next scan cycle.
+        """
         if self.protection_mode_reason:
             logger.warning("Skipped new entry because protection mode is active: %s", self.protection_mode_reason)
-            return
+            return True
         try:
             self.assert_runtime_safety("pre-entry")
         except SafetyShutdown as exc:
@@ -1610,16 +1647,23 @@ class Bot:
 
         if self.already_holding(market_id, decision.event_id):
             logger.info("Skipped %s because position already exists for market/event", market_id)
-            return
+            return True
 
         size_usd = self.size_position(decision)
         if size_usd <= 0:
             logger.info("Skipped %s because bankroll/exposure cap is full", market_id)
-            return
+            return True
 
         gamma_market = self.gamma.resolve_market(market)
         token_id = pick_token_id(gamma_market, decision.side)
         condition_id = extract_condition_id(gamma_market) or extract_condition_id(market)
+
+        if not self.trader.check_entry_liquidity(token_id, size_usd):
+            logger.warning("Skipped %s — insufficient order book liquidity for $%.2f entry", market_id, size_usd)
+            # Transient: empty order book. Return False so handle_feed_item leaves the
+            # event unseen and retries it when liquidity returns.
+            return False
+
         response = self.trader.place_market_buy(
             token_id=token_id,
             amount_usd=size_usd,
@@ -1632,7 +1676,7 @@ class Bot:
         if self.response_indicates_ban_risk(response):
             if self.attempt_runtime_paper_fallback("compliance_or_geoblock", "pre_entry_response"):
                 return self.execute_trade(decision)
-            raise SafetyShutdown(f"pre-entry: Polymarket response indicates compliance/geoblock risk; terminating: {response}")
+            raise SafetyShutdown(f"pre-entry: Polymarket response indicates compliance/geoblock risk; terminating: {response}")  # noqa: E501
         fill = parse_fill_result(
             response=response,
             fallback_price=decision.probability,
@@ -1712,7 +1756,7 @@ class Bot:
             fallback_reason = self.response_indicates_live_unavailable(response)
             if fallback_reason and self.attempt_runtime_paper_fallback(fallback_reason, "entry_rejected"):
                 return self.execute_trade(decision)
-            return
+            return True  # entry rejected — terminal, mark event seen
 
         current_value_usd = round(fill.filled_shares * fill.avg_price, 6)
         position = {
@@ -1824,7 +1868,8 @@ class Bot:
                 repo.debit_account_on_entry(conn, ACCOUNT_KEY, fill.filled_value_usd)
             self.refresh_account_state_from_db()
         except Exception as exc:
-            logger.warning("DB write failed (buy_filled): %s", exc)
+            self._db_write_critical("buy_filled", exc)
+        return True  # trade placed — terminal
 
     def current_position_probability(self, position: dict[str, Any], market: dict[str, Any]) -> float:
         side = str(position.get("side", "YES"))
@@ -2277,7 +2322,15 @@ class Bot:
                         metadata={"total_realized_pnl_usd": closed.get("total_realized_pnl_usd", 0)},
                     )
         except Exception as exc:
-            logger.warning("DB write failed (close_position): %s", exc)
+            self._db_write_critical("close_position", exc)
+        # DB write succeeded (or paper mode logged and continued).
+        # Only now apply in-memory mutations so that a crash between the exchange
+        # fill and the DB write leaves the position still visible in self.positions,
+        # which persist_runtime_state() can flush to Postgres before exiting.
+        if updated_position is None:
+            self.positions.pop(market_id, None)
+        else:
+            self.positions[market_id] = updated_position
         self.sync_account_market_state(refresh_prices=False)
 
     def monitor_positions(self) -> None:
@@ -2453,17 +2506,73 @@ class Bot:
                                 )
                     except Exception as exc:
                         logger.warning("DB write failed (exit_fill_update): %s", exc)
+                    # Apply in-memory mutations now (non-critical path — continue on DB failure)
+                    if updated_position is None:
+                        self.positions.pop(market_id, None)
+                    else:
+                        self.positions[market_id] = updated_position
                     position = updated_position
                     self.sync_account_market_state(refresh_prices=False, persist_positions=False)
 
-                if status.remaining_shares <= 0 or status.is_terminal and status.status in {"filled", "cancelled", "canceled", "expired"}:
+                if status.remaining_shares <= 0 or status.is_terminal:
                     self.pending_orders.pop(order_id, None)
                     try:
                         with get_db() as conn:
                             repo.close_order_in_db(conn, order_id, status.status)
+                            if status.status == "rejected":
+                                repo.insert_trade_event(
+                                    conn,
+                                    action_type="rejected",
+                                    order_id=order_id,
+                                    position_id=pos_position_id,
+                                    market_id=market_id,
+                                    token_id=str(pending.get("token_id", "")),
+                                    condition_id=pending.get("condition_id"),
+                                    status=status.status,
+                                    requested_mode=self.requested_mode,
+                                    effective_mode=self.effective_mode,
+                                    execution_mode="quoted_execution",
+                                    requested_price=as_float(pending.get("limit_price")),
+                                    requested_value_usd=round(
+                                        initial_shares * as_float(pending.get("limit_price")),
+                                        6,
+                                    ),
+                                    requested_shares=initial_shares,
+                                    remaining_shares=status.remaining_shares,
+                                    reason=str(pending.get("exit_reason", "pending_exit")),
+                                    metadata={"last_status": status.raw_response},
+                                )
                     except Exception as exc:
                         logger.warning("DB write failed (close_order terminal): %s", exc)
                     self.save_state()
+                    # A rejected exit leaves the position unmanaged.  Immediately
+                    # resubmit so the position is not silently stranded open.
+                    if status.status == "rejected":
+                        live_position = self.positions.get(market_id)
+                        if live_position and current_position_shares(live_position) > 0:
+                            replacement_prob = as_float(
+                                live_position.get("current_probability"),
+                                as_float(live_position.get("entry_probability"), 0.5),
+                            )
+                            logger.warning(
+                                "[rejected-retry] Exit for %s was rejected — resubmitting "
+                                "(original reason: %s, replacement prob: %.4f)",
+                                market_id, pending.get("exit_reason"), replacement_prob,
+                            )
+                            try:
+                                self.close_position(
+                                    market_id,
+                                    live_position,
+                                    f"rejected_retry:{pending.get('exit_reason', 'pending_exit')}",
+                                    replacement_prob,
+                                )
+                            except SafetyShutdown:
+                                raise
+                            except Exception as exc:
+                                logger.exception(
+                                    "[rejected-retry] Failed to resubmit exit for %s: %s",
+                                    market_id, exc,
+                                )
                     continue
 
                 pending["remaining_shares"] = status.remaining_shares
@@ -2814,6 +2923,11 @@ class Bot:
                             )
                 except Exception as exc:
                     logger.warning("DB write failed (startup_reconcile_fill): %s", exc)
+                # Apply in-memory mutations now (startup path — continue on DB failure)
+                if updated_position is None:
+                    self.positions.pop(market_id, None)
+                else:
+                    self.positions[market_id] = updated_position
                 position = updated_position
                 changed = True
 
@@ -2829,9 +2943,60 @@ class Bot:
                 try:
                     with get_db() as conn:
                         repo.close_order_in_db(conn, order_id, status.status)
+                        if status.status == "rejected":
+                            repo.insert_trade_event(
+                                conn,
+                                action_type="rejected",
+                                order_id=order_id,
+                                position_id=position.get("position_id"),
+                                market_id=market_id,
+                                token_id=str(pending.get("token_id", "")),
+                                condition_id=pending.get("condition_id"),
+                                status=status.status,
+                                requested_mode=self.requested_mode,
+                                effective_mode=self.effective_mode,
+                                execution_mode="quoted_execution",
+                                requested_price=as_float(pending.get("limit_price")),
+                                requested_value_usd=round(
+                                    initial_shares * as_float(pending.get("limit_price")),
+                                    6,
+                                ),
+                                requested_shares=initial_shares,
+                                remaining_shares=status.remaining_shares,
+                                reason=f"{pending.get('exit_reason', 'startup_reconcile')}_startup_reconcile",
+                                metadata={"last_status": status.raw_response},
+                            )
                 except Exception as exc:
                     logger.warning("DB write failed (terminal startup order): %s", exc)
                 changed = True
+                # A rejected exit at startup leaves the position unmanaged.
+                # Resubmit immediately so startup reconcile doesn't leave it stranded.
+                if status.status == "rejected":
+                    live_position = self.positions.get(market_id)
+                    if live_position and current_position_shares(live_position) > 0:
+                        replacement_prob = as_float(
+                            live_position.get("current_probability"),
+                            as_float(live_position.get("entry_probability"), 0.5),
+                        )
+                        logger.warning(
+                            "[rejected-retry] Startup reconcile: exit for %s was rejected — "
+                            "resubmitting (original reason: %s, prob: %.4f)",
+                            market_id, pending.get("exit_reason"), replacement_prob,
+                        )
+                        try:
+                            self.close_position(
+                                market_id,
+                                live_position,
+                                f"rejected_startup:{pending.get('exit_reason', 'startup_reconcile')}",
+                                replacement_prob,
+                            )
+                        except SafetyShutdown:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "[rejected-retry] Failed to resubmit startup exit for %s: %s",
+                                market_id, exc,
+                            )
                 continue
 
             self.pending_orders[order_id]["remaining_shares"] = status.remaining_shares
@@ -2917,11 +3082,16 @@ class Bot:
             return
 
         signal = self.musashi.analyze_text(tweet_text, min_confidence=0.5, max_results=3)
-        self.record_seen(str(event_id))
         decision = self.should_trade(signal)
         if not decision:
+            # No actionable signal — permanently consume the event.
+            self.record_seen(str(event_id))
             return
-        self.execute_trade(decision)
+        # execute_trade returns False for transient skips (e.g. empty order book).
+        # Only mark the event seen for terminal outcomes so that a temporary
+        # liquidity gap does not permanently suppress a valid signal.
+        if self.execute_trade(decision):
+            self.record_seen(str(event_id))
 
     def _handle_sigterm(self, signum: int, frame: Any) -> None:
         logger.info("SIGTERM received — initiating clean shutdown")
