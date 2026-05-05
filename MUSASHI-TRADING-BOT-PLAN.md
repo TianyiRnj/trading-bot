@@ -30,12 +30,13 @@
   - 改金额
   - 拒单
   - 完整平仓
-- 当用户请求 `live mode` 但出现以下任一情况时，bot 需要自动降级到 `paper mode` 并继续运行：
+- 当用户请求 `live mode` 但出现以下任一情况时，bot 需要在“没有真实 live 持仓或挂单暴露”的前提下自动降级到 `paper mode` 并继续运行：
   - 缺少 Polymarket API 凭证
   - API 凭证无效
   - 账户余额不足或无法下单
   - 地区被 ban / geoblock
   - live 初始化失败或被风控拒绝
+- 如果已经存在真实 live 持仓或挂单，bot 不应直接切到 `paper mode` 继续记账；应先进入保护流程，优先 reconcile、撤单或收敛真实风险，待账户回到 flat 后再允许切换到 `paper mode`
 - bot 停止前和重启后需要保证状态连续：
   - 可捕获退出时先缓存
   - 下次启动时恢复上次持仓、挂单、资金状态、交易动作
@@ -183,7 +184,72 @@
 
 ## 分阶段实施计划
 
-## Phase 1：让主策略的模式管理真正可用
+说明：
+
+- 实际实施顺序以“实施步骤（执行版）”中的 `Step 1-8` 为唯一准线。
+- 本节中的 `Phase 1-7` 只用于按能力域分组说明，不代表另一套独立实施顺序。
+- 后文的“推荐实施顺序”“最小可交付版本”“建议的分轮实施范围”都统一映射到 `Step 1-8`。
+
+## 实施步骤（执行版）
+
+以下顺序是本计划唯一使用的执行顺序。
+
+### Step 1：固定存储边界
+
+- 明确 `Postgres` 是唯一真源
+- 明确 `bot/data/` 旧文件不做迁移、不做回填、不做双写
+- 明确 `bot.log` 继续作为文本日志保留
+
+### Step 2：完成模式控制
+
+- 实现 `requested_mode`
+- 实现 `effective_mode`
+- 实现 `live -> paper` 自动降级
+- 记录降级原因
+
+### Step 3：接入 Postgres 基础设施
+
+- 配置连接层
+- 建立 schema / migration
+- 建立核心 repository
+- 建立启动时数据库可用性检查
+
+### Step 4：切换主运行态到 Postgres
+
+- 持仓改写入 `positions`
+- 订单改写入 `orders`
+- 动作改写入 `trade_events`
+- 账户状态改写入 `account_state`
+- feed 去重改写入 `seen_events`
+
+### Step 5：补齐恢复与退出
+
+- 启动时从 `Postgres` 恢复状态
+- 对 open / pending 订单做 reconcile
+- 支持 `Ctrl+C` / `SIGTERM` 最终 flush
+- 用即时写库兜底 `SIGKILL`
+
+### Step 6：补齐交易执行生命周期
+
+- 实现 `direct_execution`
+- 实现 `quoted_execution`
+- 支持 pending、撤单、改价、改金额、重新挂单
+- 保证每一步都写入 `trade_events`
+
+### Step 7：补齐实时查看
+
+- 输出 metrics / positions / orders / actions API
+- dashboard 改从 `Postgres` 查询
+- 展示资金曲线、持仓、订单、动作时间线
+
+### Step 8：补齐风控、测试与文档
+
+- 重构动态资金模型
+- 增强 live readiness
+- 补测试
+- 收口 README 和配置说明
+
+## Phase 1：让主策略的模式管理真正可用（能力分组，对应 Step 2）
 
 目标：
 
@@ -204,6 +270,8 @@
    - 余额不足或无法下单时自动降级
    - 地区被 ban / geoblock 时自动降级
    - live 初始化失败、鉴权失败、合规拒绝时自动降级
+   - 仅在尚未产生真实 live 持仓或挂单时，允许直接自动降级并继续以 `paper mode` 运行
+   - 如果已经存在真实 live 持仓或挂单，不允许直接把账本切到 `paper mode`；应暂停新的模拟下单，先 reconcile、撤单或收敛 live 风险，待账户 flat 后再允许切到 `paper`
 
 3. 调整运行安全策略
    - 让 `paper mode` 与 `live mode` 区分处理
@@ -218,6 +286,7 @@
    - 明确记录 `requested_mode`
    - 明确记录 `effective_mode`
    - 明确记录降级原因
+   - 明确记录是否因为存在真实 live exposure 而延迟降级
    - 明确记录某次跳过安全检查的原因
    - 明确记录 bot 已成功进入主循环
 
@@ -230,17 +299,18 @@
 
 - `paper mode` 在开发环境可以连续运行
 - 主交易策略可以开始积累真实模拟记录
-- live 不可用时，bot 会自动切到 paper 继续运行
+- live 不可用且不存在真实 live exposure 时，bot 会自动切到 paper 继续运行
 
 验收标准：
 
 - 在 `BOT_MODE=paper` 下，bot 不因美国地区检测而立即退出
 - 在用户请求 `BOT_MODE=live` 且 live 条件不满足时，bot 自动降级到 `paper`
+- 如果已经存在真实 live 持仓或挂单，bot 不会直接切到 `paper` 记账，而是先执行保护流程
 - 日志和 dashboard 能明确显示降级原因
 - bot 成功进入轮询主循环
-- 产生主策略交易记录文件
+- 产生主策略交易记录或交易事件
 
-## Phase 2：引入 `Postgres` 主存储、实时业绩统计与交易事件模型
+## Phase 2：引入 `Postgres` 主存储、实时业绩统计与交易事件模型（能力分组，覆盖 Step 1、Step 3、Step 4、Step 6、Step 7）
 
 目标：
 
@@ -264,7 +334,7 @@
    - `seen_events`
    - `mode_state`
    - 视需要增加 `price_snapshots` 或 `equity_snapshots`
-   - 为 `order_id`、`market_id`、`status`、`created_at`、`action_type` 建索引
+   - 为 `order_id`、`client_order_id`、`venue_order_id`、`market_id`、`status`、`created_at`、`action_type` 建索引
 
 3. 定义存储分工
    - `Postgres` 作为唯一真源
@@ -314,6 +384,8 @@
      - `market_id`
      - `token_id`
      - `order_id`
+     - `client_order_id`
+     - `venue_order_id`
      - `parent_order_id`
      - `action_type`
      - `status`
@@ -350,7 +422,7 @@
    - 计算当前未实现盈亏
    - 汇总每个市场、每笔交易、每个时间段的表现
    - 汇总每类 action 的次数与最近状态
-   - 允许按 `order_id` 回放订单生命周期
+   - 允许按内部 `order_id`、`client_order_id` 或外部 `venue_order_id` 回放订单生命周期
    - 允许区分 `direct_execution` 与 `quoted_execution` 的表现
 
 9. 输出主策略统计 API
@@ -390,6 +462,257 @@
 - `quoted_execution` 的未成交订单可以被单独追踪、撤单、改价、改金额并记录结果
 - 查询性能在单实例 bot 场景下不成为主要瓶颈
 
+## Phase 3：新增主策略实时 dashboard（能力分组，对应 Step 7）
+
+目标：
+
+- 让用户不用手翻数据库或 JSON 文件就能实时查看 bot 表现和订单动作
+
+计划改动：
+
+1. 改造现有 Flask dashboard
+   - 不再只服务套利模拟
+   - 增加主策略视图
+   - 视情况保留套利视图作为单独模块
+   - 支持实时刷新
+   - dashboard 主查询源改为 `Postgres`
+
+2. 设计主策略页面
+   - 账户概览
+   - 当前持仓列表
+   - open orders / pending orders 列表
+   - 最近交易
+   - 实时交易动作时间线
+   - 收益统计
+   - 最近日志
+
+3. 增加关键可视化
+   - 总资产变化
+   - 已实现收益曲线
+   - 未实现收益变化
+   - 胜负分布
+   - 按市场分类的收益统计
+   - 按 action_type 分类的动作统计
+
+4. 标注模式与数据来源
+   - 明确区分 `paper mode` 和 `live mode`
+   - 明确页面当前看的是什么策略数据
+
+5. 设计交易动作面板
+   - 单独显示已完成动作
+   - 单独显示买进动作
+   - 单独显示卖出动作
+   - 单独显示 pending 动作
+   - 单独显示取消动作
+   - 单独显示改价动作
+   - 单独显示改金额动作
+   - 支持按市场、订单、状态、动作类型筛选
+   - 支持点开单笔订单查看完整动作链路
+
+6. 设计执行模式与订单详情面板
+   - 单独标记 `direct_execution` 与 `quoted_execution`
+   - 对报价单展示目标价格、当前价格、等待方向、剩余数量
+   - 对未完成报价单展示下一步动作，例如继续等待、撤单、改价、改金额
+
+交付结果：
+
+- 用户可以通过本地 dashboard 实时查看主策略成绩
+- 用户可以实时查看每一笔交易和订单动作
+
+验收标准：
+
+- 打开 dashboard 后能直接看到主策略关键指标
+- 最近交易与 `Postgres trade_events` 一致
+- 页面明确显示当前模式和数据来源
+- 动作面板能够单独列出 `买进 / 卖出 / pending / 取消 / 改价 / 改金额 / 已完成`
+- 新事件产生后页面能在可接受延迟内刷新出来
+- 报价单的等待中状态、修改动作、取消动作都能单独看到
+
+## Phase 4：补齐退出持久化与启动恢复（能力分组，对应 Step 5）
+
+目标：
+
+- 让 bot 在退出和重启之间保持状态连续
+- 让用户明确知道哪些退出路径可以保证最终 flush，哪些只能依赖即时落盘
+
+计划改动：
+
+1. 定义持久化策略
+   - 每次关键状态变化立即写入 `Postgres`
+   - 增加周期性快照
+   - 持久化范围至少包括：
+     - 账户状态
+     - 当前持仓
+     - open / pending orders
+     - 交易事件流
+     - 最近模式与降级原因
+
+2. 定义可捕获退出的 flush 行为
+   - `Ctrl+C` / `SIGINT`
+   - 正常程序退出
+   - `kill <PID>` 对应的 `SIGTERM`
+   - 系统关机时若进程收到可捕获终止信号，也应执行最终 flush
+
+3. 明确不可捕获退出边界
+   - `kill -9` / `SIGKILL` 无法执行最终 flush
+   - 对这类退出不承诺“最后一刻再保存”
+   - 通过“关键状态即时写入 `Postgres` + 周期快照”尽量减少丢失
+
+4. 定义启动恢复范围
+   - 从 `Postgres` 读取账户状态
+   - 从 `Postgres` 读取当前持仓
+   - 从 `Postgres` 读取 pending / open orders
+   - 从 `Postgres` 读取交易事件流
+   - 从 `Postgres` 读取最近 `requested_mode` / `effective_mode`
+
+5. 定义恢复后的 reconcile 流程
+   - 启动时先从 `Postgres` 恢复状态
+   - 然后与外部交易状态或 paper 状态做 reconcile
+   - 恢复后继续追踪上次未完成的报价单和 pending 订单
+
+交付结果：
+
+- 可捕获退出路径下，bot 能在退出前保存最终状态
+- 下次启动时，bot 能恢复上次的交易上下文并继续运行
+
+验收标准：
+
+- `Ctrl+C` 后重启，能看到上次持仓和 pending 订单
+- `kill <PID>` 后重启，能看到上次持仓和 pending 订单
+- 未完成的报价单会在重启后继续被追踪或 reconcile
+- 文档明确说明 `SIGKILL` 只能依赖即时落盘兜底，不能承诺最终 flush
+
+## Phase 5：把资金池从静态风控值升级为真实账户模型（能力分组，对应 Step 8 的账户模型部分）
+
+目标：
+
+- 让“给 bot 10 美元或 100 美元”的设定更真实
+
+计划改动：
+
+1. 定义账户状态结构
+   - `initial_bankroll`
+   - `cash_balance`
+   - `realized_pnl`
+   - `unrealized_pnl`
+   - `equity`
+   - `max_equity`
+   - `drawdown`
+
+2. 重构仓位 sizing 逻辑
+   - 下单不再只看静态 `BANKROLL_USD`
+   - 基于当前 `cash_balance` 和 `equity` 计算可下单额度
+   - 收益后允许在风控范围内扩大可用资金
+   - 亏损后自动收缩
+
+3. 持久化账户状态
+   - 写入 `account_state` 表
+   - 启动时读取并恢复
+   - 平仓后更新
+
+4. 支持收益率指标
+   - 绝对收益
+   - 收益率
+   - 日收益
+   - 回撤
+
+交付结果：
+
+- 资金规模与 bot 长期表现绑定
+- 用户给 `10 USD` 和 `100 USD` 时，运行结果会真实反映资金变化
+
+验收标准：
+
+- 平仓后账户现金会正确变化
+- 当前权益 = 现金 + 持仓浮动价值
+- 后续下单额度会随盈亏变化
+
+## Phase 6：提高 `live mode` 上线准备度（能力分组，对应 Step 8 的 live readiness 部分）
+
+目标：
+
+- 把“代码支持 live”提升为“实际更适合上线 live”
+
+计划改动：
+
+1. 补充 live readiness 检查
+   - 环境变量完整性检查
+   - Polymarket 凭证检查
+   - API 可连通性检查
+   - 市场解析与 token 解析检查
+   - WebSocket 可用性检查
+
+2. 明确 live 风险开关
+   - 强制用户显式确认 `BOT_MODE=live`
+   - 增加更严格的 dry-run / confirm 配置
+   - 限制首次上线时的最大仓位
+
+3. 增强故障恢复
+   - 启动时恢复持仓与挂单状态
+   - 避免重复提交订单
+   - 更清楚地区分“未成交、部分成交、成交失败、被拒绝”
+
+4. 增强运行监控
+   - 更清楚的错误日志
+   - 关键事件日志
+   - 可选告警能力
+
+交付结果：
+
+- `live mode` 的启动风险更低
+- 出问题后更容易定位
+
+验收标准：
+
+- 缺少关键配置时能在启动前明确失败
+- live 启动流程可以输出完整 readiness 检查结果
+- 出现订单异常时可追踪原因
+
+## Phase 7：测试、验证与文档收口（能力分组，对应 Step 8 的测试与文档部分）
+
+目标：
+
+- 确保改动可维护、可复用、可交接
+
+计划改动：
+
+1. 补充测试
+   - 主策略统计测试
+   - `Postgres` schema / migration 测试
+   - 交易事件流测试
+   - 模式自动降级测试
+   - 退出持久化与启动恢复测试
+   - 报价单 pending / cancel / reprice / resize 测试
+   - 账户状态计算测试
+   - `paper mode` 安全策略测试
+   - dashboard 数据接口测试
+   - 实时 actions / orders API 测试
+
+2. 更新 README
+   - 增加主策略运行说明
+   - 增加主策略 dashboard 说明
+   - 增加账户模型说明
+   - 增加 `paper` 与 `live` 模式区别
+   - 增加 `Postgres` 配置、启动和迁移说明
+
+3. 更新 `.env.example`
+   - 新增 `Postgres` 必要配置项
+   - 增加注释说明
+
+4. 更新 `.gitignore`
+   - 如果新增本地状态文件或导出文件，需要明确忽略策略
+
+交付结果：
+
+- 文档和代码行为一致
+- 新用户可以从 README 理解如何运行与查看结果
+
+验收标准：
+
+- README 足以指导从零启动
+- 新增测试覆盖关键统计与资金逻辑
+- 配置样例与实际代码一致
+
 ## Postgres 数据结构（V1）
 
 参考初始化文件：
@@ -428,6 +751,7 @@
 关键字段：
 
 - `account_key`
+- `initial_bankroll`
 - `requested_mode`
 - `effective_mode`
 - `cash_balance`
@@ -478,6 +802,8 @@
 关键字段：
 
 - `order_id`
+- `client_order_id`
+- `venue_order_id`
 - `parent_order_id`
 - `position_id`
 - `market_id`
@@ -512,6 +838,8 @@
 
 - `event_id`
 - `order_id`
+- `client_order_id`
+- `venue_order_id`
 - `position_id`
 - `market_id`
 - `condition_id`
@@ -594,7 +922,7 @@
 6. 得出 `effective_mode`
 7. 把模式状态写入 `mode_state`
 8. 从 `Postgres` 恢复 `account_state`、`positions`、`orders`、`trade_events`
-9. 对恢复出的 open / pending 订单执行 reconcile
+9. 对恢复出的 open / pending 订单基于 `client_order_id` / `venue_order_id` 执行 reconcile
 10. 启动主循环
 
 ### 2. 信号处理流程
@@ -611,15 +939,26 @@
 1. 创建订单记录
 2. 写入 `buy_submitted` 或 `sell_submitted`
 3. 直接按当前可成交价格发单
-4. 如果成交：
+4. 如果部分成交：
+   - 更新 `orders` 的 `filled_shares`、`remaining_shares` 与状态
+   - 增量更新 `positions`
+   - 增量更新 `account_state`
+   - 写入 `partial_fill`
+   - 对剩余数量继续保持 pending，或创建新的子订单继续执行
+5. 如果全部成交：
    - 更新 `orders`
    - 更新 `positions`
    - 更新 `account_state`
    - 写入 `buy_filled` / `sell_filled`
-5. 如果失败：
+6. 如果失败且不存在真实 live exposure：
    - 更新 `orders`
    - 写入 `rejected`
    - 如果是 `live` 且触发降级条件，切换为 `paper`
+7. 如果失败但已经存在真实 live exposure：
+   - 更新 `orders`
+   - 写入 `rejected`
+   - 不直接切换到 `paper`
+   - 暂停新的模拟下单，先 reconcile、撤单或收敛真实 live 风险
 
 ### 4. `quoted_execution` 流程
 
@@ -627,13 +966,18 @@
 2. 写入 `quote_submitted`
 3. 进入等待状态并写入 `pending`
 4. 定时检查当前价格与目标价格
-5. 如果价格满足：
-   - 成交
+5. 如果价格满足且部分成交：
+   - 更新 `orders` 的 `filled_shares`、`remaining_shares` 与状态
+   - 增量更新 `positions`
+   - 增量更新 `account_state`
+   - 写入 `partial_fill`
+   - 对剩余数量继续保持 `pending`，或在撤单/改价后创建新的子订单
+6. 如果价格满足且全部成交：
    - 更新 `orders`
    - 更新 `positions`
    - 更新 `account_state`
    - 写入 `buy_filled` / `sell_filled`
-6. 如果长时间未完成：
+7. 如果长时间未完成或只完成了部分数量：
    - 撤单时写入 `cancel_requested` / `canceled`
    - 改价时写入 `reprice_requested` / `repriced`
    - 改金额时写入 `amount_modified`
@@ -655,366 +999,52 @@
 2. 周期性写入 `equity_snapshots`
 3. 收到 `Ctrl+C`、正常退出或 `SIGTERM` 时执行最终 flush
 4. 下次启动时先从 `Postgres` 恢复状态
-5. 对未完成订单继续追踪、撤单、改价或完成
+5. 基于 `client_order_id` / `venue_order_id` 对未完成订单继续追踪、撤单、改价或完成
 6. `SIGKILL` 无法执行最终 flush，只能依赖之前已经写入的数据
-
-## 实施步骤（执行版）
-
-### Step 1：固定存储边界
-
-- 明确 `Postgres` 是唯一真源
-- 明确 `bot/data/` 旧文件不做迁移、不做回填、不做双写
-- 明确 `bot.log` 继续作为文本日志保留
-
-### Step 2：完成模式控制
-
-- 实现 `requested_mode`
-- 实现 `effective_mode`
-- 实现 `live -> paper` 自动降级
-- 记录降级原因
-
-### Step 3：接入 Postgres 基础设施
-
-- 配置连接层
-- 建立 schema / migration
-- 建立核心 repository
-- 建立启动时数据库可用性检查
-
-### Step 4：切换主运行态到 Postgres
-
-- 持仓改写入 `positions`
-- 订单改写入 `orders`
-- 动作改写入 `trade_events`
-- 账户状态改写入 `account_state`
-- feed 去重改写入 `seen_events`
-
-### Step 5：补齐恢复与退出
-
-- 启动时从 `Postgres` 恢复状态
-- 对 open / pending 订单做 reconcile
-- 支持 `Ctrl+C` / `SIGTERM` 最终 flush
-- 用即时写库兜底 `SIGKILL`
-
-### Step 6：补齐交易执行生命周期
-
-- 实现 `direct_execution`
-- 实现 `quoted_execution`
-- 支持 pending、撤单、改价、改金额、重新挂单
-- 保证每一步都写入 `trade_events`
-
-### Step 7：补齐实时查看
-
-- 输出 metrics / positions / orders / actions API
-- dashboard 改从 `Postgres` 查询
-- 展示资金曲线、持仓、订单、动作时间线
-
-### Step 8：补齐风控、测试与文档
-
-- 重构动态资金模型
-- 增强 live readiness
-- 补测试
-- 收口 README 和配置说明
-
-## Phase 3：新增主策略实时 dashboard
-
-目标：
-
-- 让用户不用手翻数据库或 JSON 文件就能实时查看 bot 表现和订单动作
-
-计划改动：
-
-1. 改造现有 Flask dashboard
-   - 不再只服务套利模拟
-   - 增加主策略视图
-   - 视情况保留套利视图作为单独模块
-   - 支持实时刷新
-   - dashboard 主查询源改为 `Postgres`
-
-2. 设计主策略页面
-   - 账户概览
-   - 当前持仓列表
-   - open orders / pending orders 列表
-   - 最近交易
-   - 实时交易动作时间线
-   - 收益统计
-   - 最近日志
-
-3. 增加关键可视化
-   - 总资产变化
-   - 已实现收益曲线
-   - 未实现收益变化
-   - 胜负分布
-   - 按市场分类的收益统计
-   - 按 action_type 分类的动作统计
-
-4. 标注模式与数据来源
-   - 明确区分 `paper mode` 和 `live mode`
-   - 明确页面当前看的是什么策略数据
-
-5. 设计交易动作面板
-   - 单独显示已完成动作
-   - 单独显示买进动作
-   - 单独显示卖出动作
-   - 单独显示 pending 动作
-   - 单独显示取消动作
-   - 单独显示改价动作
-   - 单独显示改金额动作
-   - 支持按市场、订单、状态、动作类型筛选
-   - 支持点开单笔订单查看完整动作链路
-
-6. 设计执行模式与订单详情面板
-   - 单独标记 `direct_execution` 与 `quoted_execution`
-   - 对报价单展示目标价格、当前价格、等待方向、剩余数量
-   - 对未完成报价单展示下一步动作，例如继续等待、撤单、改价、改金额
-
-交付结果：
-
-- 用户可以通过本地 dashboard 实时查看主策略成绩
-- 用户可以实时查看每一笔交易和订单动作
-
-验收标准：
-
-- 打开 dashboard 后能直接看到主策略关键指标
-- 最近交易与 `Postgres trade_events` 一致
-- 页面明确显示当前模式和数据来源
-- 动作面板能够单独列出 `买进 / 卖出 / pending / 取消 / 改价 / 改金额 / 已完成`
-- 新事件产生后页面能在可接受延迟内刷新出来
-- 报价单的等待中状态、修改动作、取消动作都能单独看到
-
-## Phase 4：补齐退出持久化与启动恢复
-
-目标：
-
-- 让 bot 在退出和重启之间保持状态连续
-- 让用户明确知道哪些退出路径可以保证最终 flush，哪些只能依赖即时落盘
-
-计划改动：
-
-1. 定义持久化策略
-   - 每次关键状态变化立即写入 `Postgres`
-   - 增加周期性快照
-   - 持久化范围至少包括：
-     - 账户状态
-     - 当前持仓
-     - open / pending orders
-     - 交易事件流
-     - 最近模式与降级原因
-
-2. 定义可捕获退出的 flush 行为
-   - `Ctrl+C` / `SIGINT`
-   - 正常程序退出
-   - `kill <PID>` 对应的 `SIGTERM`
-   - 系统关机时若进程收到可捕获终止信号，也应执行最终 flush
-
-3. 明确不可捕获退出边界
-   - `kill -9` / `SIGKILL` 无法执行最终 flush
-   - 对这类退出不承诺“最后一刻再保存”
-   - 通过“关键状态即时写入 `Postgres` + 周期快照”尽量减少丢失
-
-4. 定义启动恢复范围
-   - 从 `Postgres` 读取账户状态
-   - 从 `Postgres` 读取当前持仓
-   - 从 `Postgres` 读取 pending / open orders
-   - 从 `Postgres` 读取交易事件流
-   - 从 `Postgres` 读取最近 `requested_mode` / `effective_mode`
-
-5. 定义恢复后的 reconcile 流程
-   - 启动时先从 `Postgres` 恢复状态
-   - 然后与外部交易状态或 paper 状态做 reconcile
-   - 恢复后继续追踪上次未完成的报价单和 pending 订单
-
-交付结果：
-
-- 可捕获退出路径下，bot 能在退出前保存最终状态
-- 下次启动时，bot 能恢复上次的交易上下文并继续运行
-
-验收标准：
-
-- `Ctrl+C` 后重启，能看到上次持仓和 pending 订单
-- `kill <PID>` 后重启，能看到上次持仓和 pending 订单
-- 未完成的报价单会在重启后继续被追踪或 reconcile
-- 文档明确说明 `SIGKILL` 只能依赖即时落盘兜底，不能承诺最终 flush
-
-## Phase 5：把资金池从静态风控值升级为真实账户模型
-
-目标：
-
-- 让“给 bot 10 美元或 100 美元”的设定更真实
-
-计划改动：
-
-1. 定义账户状态结构
-   - `initial_bankroll`
-   - `cash_balance`
-   - `realized_pnl`
-   - `unrealized_pnl`
-   - `equity`
-   - `max_equity`
-   - `drawdown`
-
-2. 重构仓位 sizing 逻辑
-   - 下单不再只看静态 `BANKROLL_USD`
-   - 基于当前 `cash_balance` 和 `equity` 计算可下单额度
-   - 收益后允许在风控范围内扩大可用资金
-   - 亏损后自动收缩
-
-3. 持久化账户状态
-   - 写入 `account_state` 表
-   - 启动时读取并恢复
-   - 平仓后更新
-
-4. 支持收益率指标
-   - 绝对收益
-   - 收益率
-   - 日收益
-   - 回撤
-
-交付结果：
-
-- 资金规模与 bot 长期表现绑定
-- 用户给 `10 USD` 和 `100 USD` 时，运行结果会真实反映资金变化
-
-验收标准：
-
-- 平仓后账户现金会正确变化
-- 当前权益 = 现金 + 持仓浮动价值
-- 后续下单额度会随盈亏变化
-
-## Phase 6：提高 `live mode` 上线准备度
-
-目标：
-
-- 把“代码支持 live”提升为“实际更适合上线 live”
-
-计划改动：
-
-1. 补充 live readiness 检查
-   - 环境变量完整性检查
-   - Polymarket 凭证检查
-   - API 可连通性检查
-   - 市场解析与 token 解析检查
-   - WebSocket 可用性检查
-
-2. 明确 live 风险开关
-   - 强制用户显式确认 `BOT_MODE=live`
-   - 增加更严格的 dry-run / confirm 配置
-   - 限制首次上线时的最大仓位
-
-3. 增强故障恢复
-   - 启动时恢复持仓与挂单状态
-   - 避免重复提交订单
-   - 更清楚地区分“未成交、部分成交、成交失败、被拒绝”
-
-4. 增强运行监控
-   - 更清楚的错误日志
-   - 关键事件日志
-   - 可选告警能力
-
-交付结果：
-
-- `live mode` 的启动风险更低
-- 出问题后更容易定位
-
-验收标准：
-
-- 缺少关键配置时能在启动前明确失败
-- live 启动流程可以输出完整 readiness 检查结果
-- 出现订单异常时可追踪原因
-
-## Phase 7：测试、验证与文档收口
-
-目标：
-
-- 确保改动可维护、可复用、可交接
-
-计划改动：
-
-1. 补充测试
-   - 主策略统计测试
-   - `Postgres` schema / migration 测试
-   - 交易事件流测试
-   - 模式自动降级测试
-   - 退出持久化与启动恢复测试
-   - 报价单 pending / cancel / reprice / resize 测试
-   - 账户状态计算测试
-   - `paper mode` 安全策略测试
-   - dashboard 数据接口测试
-   - 实时 actions / orders API 测试
-
-2. 更新 README
-   - 增加主策略运行说明
-   - 增加主策略 dashboard 说明
-   - 增加账户模型说明
-   - 增加 `paper` 与 `live` 模式区别
-   - 增加 `Postgres` 配置、启动和迁移说明
-
-3. 更新 `.env.example`
-   - 新增 `Postgres` 必要配置项
-   - 增加注释说明
-
-4. 更新 `.gitignore`
-   - 如果新增本地状态文件或导出文件，需要明确忽略策略
-
-交付结果：
-
-- 文档和代码行为一致
-- 新用户可以从 README 理解如何运行与查看结果
-
-验收标准：
-
-- README 足以指导从零启动
-- 新增测试覆盖关键统计与资金逻辑
-- 配置样例与实际代码一致
 
 ## 推荐实施顺序
 
-建议按下面顺序推进：
+执行时统一按 `Step 1-8` 推进，不再额外维护第二套顺序：
 
-1. 修复模式管理和 `live -> paper` 自动降级
-2. 引入 `Postgres` 主存储
-3. 补退出持久化与启动恢复
-4. 补主策略统计能力与交易事件模型
-5. 补主策略 dashboard
-6. 重构动态账户模型
-7. 增强 `live mode` readiness
-8. 最后统一补测试与文档
+1. `Step 1`：固定存储边界
+2. `Step 2`：完成模式控制
+3. `Step 3`：接入 `Postgres` 基础设施
+4. `Step 4`：切换主运行态到 `Postgres`
+5. `Step 5`：补齐恢复与退出
+6. `Step 6`：补齐交易执行生命周期
+7. `Step 7`：补齐实时查看
+8. `Step 8`：补齐风控、测试与文档
 
-原因：
+按这个顺序拆分轮次：
 
-- 第 1 步先保证 bot 在 live 不可用时也不会直接废掉
-- 第 2 步先把状态真源统一到 `Postgres`
-- 第 3 步再保证中断后不会丢掉主要状态
-- 第 4 步和第 5 步能尽快回答“这 bot 现在在做什么、到底赚没赚钱”
-- 第 6 步才能让 `10 USD` / `100 USD` 的资金概念变得真实
-- 第 7 步适合在前面都稳定后再推进，否则 live 风险太高
+- 第一轮：`Step 1-5`
+- 第二轮：`Step 6-7`
+- 第三轮：`Step 8`
 
 ## 最小可交付版本
 
-如果优先做一个最快能用的版本，建议先完成下面这组：
+如果优先做一个最快能用的版本，MVP 也统一按 `Step 1-8` 选子集，不再单独定义另一套路线。建议先完成 `Step 1-7` 中的最小必要范围：
 
-1. 用户请求 `live` 但 live 条件不满足时，自动降级为 `paper`
-2. `paper mode` 不再因美国地区检查直接退出
-3. 引入 `Postgres` 并完成核心表初始化
-4. 主策略直接写入 `Postgres`
-5. 旧 `bot/data/` 文件保持为空或停止使用
-6. 对 `Ctrl+C`、正常退出、`kill <PID>` 做退出前 flush，并在下次启动时恢复
-7. 支持 `direct_execution` 和 `quoted_execution`
-8. 对未完成报价单支持 pending、撤单、改价、改金额
-9. dashboard 展示主策略：
-   - 总收益
-   - 已实现收益
-   - 未实现收益
-   - 当前持仓
-   - 最近交易
-   - open orders / pending orders
-   - 交易动作时间线
-   - 当前 `requested_mode` / `effective_mode`
-   - 当前模式
-10. 账户资金至少支持：
-   - 初始资金
-   - 可用现金
-   - 已实现收益
-   - 当前总权益
+1. 对应 `Step 1`：
+   - 旧 `bot/data/` 文件保持为空或停止使用
+   - `Postgres` 成为唯一真源
+2. 对应 `Step 2`：
+   - 用户请求 `live` 但 live 条件不满足时，自动降级为 `paper`
+   - `paper mode` 不再因美国地区检查直接退出
+3. 对应 `Step 3`：
+   - 引入 `Postgres` 并完成核心表初始化
+4. 对应 `Step 4`：
+   - 主策略直接写入 `Postgres`
+5. 对应 `Step 5`：
+   - 对 `Ctrl+C`、正常退出、`kill <PID>` 做退出前 flush，并在下次启动时恢复
+6. 对应 `Step 6`：
+   - 支持 `direct_execution` 和 `quoted_execution`
+   - 对未完成报价单支持 pending、撤单、改价、改金额
+7. 对应 `Step 7`：
+   - dashboard 展示主策略的总收益、已实现收益、未实现收益、当前持仓、最近交易、open orders / pending orders、交易动作时间线、当前 `requested_mode` / `effective_mode`、当前模式。
+   - 账户资金至少支持基础状态展示：初始资金、可用现金、已实现收益、当前总权益。
+
+MVP 到这里为止，不要求完整完成 `Step 8` 中的动态资金风控模型、完整 live readiness 收口和全量测试矩阵。
 
 完成这一组后，项目就能基本接近你最初的目标：
 
@@ -1030,6 +1060,7 @@
 - `live mode` 涉及 Polymarket 地区限制与平台规则，必须继续保留严格防护。
 - `paper mode` 放宽检查时，不能误伤 `live mode` 的安全逻辑。
 - `live -> paper` 自动降级必须清楚记录原因，避免用户误以为自己还在实盘。
+- 如果仍有真实 live 持仓或挂单，就不能把账本直接切成 `paper mode` 继续模拟，否则会产生真实风险和虚拟账本错位。
 - `Postgres` 不应成为主要性能瓶颈，但需要通过索引、短事务和合理连接池避免把 dashboard 查询拖进交易路径。
 - 旧文件既然不迁移也不参与主流程，就要避免任何双写或“数据库失败再退回 JSON”的隐式兼容路径。
 - 交易记录结构一旦定下来，后续统计逻辑会依赖它，最好尽早稳定格式。
@@ -1040,17 +1071,43 @@
 - 报价单支持改价和改金额后，需要避免重复订单、幽灵挂单和事件流错序。
 - 如果 `Postgres` 是远程实例，必须考虑短时网络抖动时的降级策略和重试策略。
 
-## 建议的第一轮实施范围
+## 建议的分轮实施范围
 
-第一轮最值得做的范围：
+为避免和 `Step 1-8` 形成第二套顺序，分轮范围统一写成对执行步骤的映射：
 
-1. 做好 `live -> paper` 自动降级
-2. 对 `paper mode` 放宽启动安全检查
-3. 引入 `Postgres` 主存储与 schema
-4. 让主运行态直接写入 `Postgres`
-5. 做好退出持久化与启动恢复
-6. 新增主策略实时统计逻辑和事件模型
-7. 改造 dashboard 以实时展示主策略结果和动作时间线
-8. 更新 README 与 `.env.example`
+### 第一轮：`Step 1-5`
 
-这轮完成后，就能先验证主策略的长期运行表现，再决定是否继续推进动态资金模型和实盘 readiness。
+1. 固定存储边界
+2. 完成模式控制
+3. 接入 `Postgres` 基础设施
+4. 切换主运行态到 `Postgres`
+5. 补齐恢复与退出
+
+第一轮完成后，bot 就具备：
+
+- `live -> paper` 自动降级
+- `Postgres` 唯一真源
+- 退出后重启恢复主要状态
+
+### 第二轮：`Step 6-7`
+
+1. 补齐交易执行生命周期
+2. 补齐实时查看
+
+第二轮完成后，用户就可以实时查看：
+
+- 收益
+- 持仓
+- open / pending orders
+- 动作时间线
+
+### 第三轮：`Step 8`
+
+1. 补齐风控、测试与文档
+
+第三轮完成后，再统一收口：
+
+- 动态资金模型
+- `live mode` readiness
+- 测试矩阵
+- README / 配置说明
