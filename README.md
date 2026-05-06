@@ -6,6 +6,20 @@ At a high level, the bot polls the Musashi `feed`, re-scores incoming text with 
 
 To make live operation more practical, the bot also tracks real fills, preserves exact share counts, handles partially filled exits, polls pending exit orders, cancels timed-out exit orders, and can re-list any remaining size. It also avoids submitting duplicate exit orders for a position that already has a pending exit order. When the bot starts, it can check the Polymarket geoblock endpoint, reconcile stale or inconsistent order state, and restore the latest account, position, and pending-order context from Postgres before trading begins.
 
+## Current Strategy
+
+The current main strategy is a Musashi-signal-driven Polymarket executor with explicit entry filters, position sizing rules, exit logic, and live-safety controls.
+
+- Signal intake: the main loop fetches high-urgency Musashi feed items, re-analyzes each text with `analyze-text`, and only considers signals that still produce a concrete `YES` or `NO` action with sufficient confidence and edge.
+- Entry filters: by default, the bot requires `confidence >= 0.76`, `edge >= 0.05`, a Polymarket venue match, `volume24h >= 20000`, and a tradable probability between `0.08` and `0.85`.
+- Market selection: if multiple candidate markets match the same signal, the bot ranks them by a composite score based on Musashi confidence, estimated edge, and market-match confidence, then trades only the top candidate.
+- Position sizing: the bot caps exposure with `BOT_MAX_POSITION_USD`, `BOT_MAX_TOTAL_EXPOSURE_USD`, and the remaining bankroll. Stronger signals receive a larger position tier, and `BOT_LIMIT_ONE_POSITION_PER_EVENT=true` prevents stacking multiple positions on the same event by default.
+- Liquidity gate: before entering, the bot checks whether the target market has usable buy-side liquidity. If the order book is temporarily empty, it skips the entry without permanently consuming the signal so the trade can be retried later.
+- Exit rules: open positions are monitored for take profit, stop loss, maximum hold time, and optional signal reversal. In live mode, exit orders can remain pending, partially fill, time out, be canceled, and be re-priced until the remaining shares are resolved.
+- Safety behavior: if live trading becomes unavailable but the bot has no real live exposure, it automatically falls back to `paper`. If real live exposure already exists, it enters protection mode, pauses new entries, and focuses on getting flat before switching modes.
+
+The optional arbitrage scanner is not the main strategy. It is a separate simulation-only sidecar that scans Polymarket versus Kalshi spreads and writes paper trade records to `bot/data/arbitrage_trades.jsonl`.
+
 ## Important Notice
 
 This bot does not guarantee profits, and it should not be treated as a strategy for maximizing returns. It is a lightweight automation tool for signal intake and order execution, not a promise of performance.

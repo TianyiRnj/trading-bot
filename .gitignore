@@ -25,5 +25,8 @@ bot/logs/
 agents.md
 claude.md
 
+# Local editor files
+.vscode/
+
 # OS files
 .DS_Store
