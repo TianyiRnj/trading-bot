@@ -9,7 +9,7 @@ try:
 except ImportError:  # pragma: no cover - dependency is declared in requirements.txt
     def load_dotenv(*args: object, **kwargs: object) -> bool:
         return False
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 
 try:
     from db import check_db_available, check_db_schema_ready, get_db, init_pool
@@ -58,11 +58,15 @@ def load_arbitrage_trades() -> list[dict[str, Any]]:
     return trades
 
 
-def get_logs(limit: int = 20) -> list[str]:
+def get_logs(limit: int | None = 20) -> list[str]:
     if not LOG_FILE.exists():
         return []
     try:
         lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").strip().split("\n")
+        if lines == [""]:
+            return []
+        if limit is None or limit <= 0:
+            return lines
         return lines[-limit:]
     except Exception:
         return []
@@ -170,15 +174,9 @@ def _serialize_metrics(summary: dict[str, Any]) -> dict[str, Any]:
     return metrics
 
 
-@app.route("/")
-def index():
-    main_data, db_error = _load_main_dashboard_data()
-    arb_trades = load_arbitrage_trades()
-    arb_metrics = _compute_arbitrage_metrics(arb_trades)
-    logs = get_logs(20)
-
+def _build_recent_arbitrage_rows(trades: list[dict[str, Any]], limit: int = 10) -> list[dict[str, Any]]:
     recent_arb_trades = []
-    for trade in arb_trades[-10:]:
+    for trade in trades[-limit:]:
         recent_arb_trades.append(
             {
                 "time": format_time(trade.get("opened_at", "")),
@@ -192,19 +190,40 @@ def index():
             }
         )
     recent_arb_trades.reverse()
+    return recent_arb_trades
 
+
+def _build_dashboard_payload() -> dict[str, Any]:
+    main_data, db_error = _load_main_dashboard_data()
+    arb_trades = load_arbitrage_trades()
+    return {
+        "summary": _serialize_metrics(main_data["summary"]),
+        "positions": main_data["positions"],
+        "orders": main_data["orders"],
+        "actions": main_data["actions"],
+        "recent_trades": main_data["recent_trades"],
+        "equity_snapshots": main_data["equity_snapshots"][-8:],
+        "arbitrage_metrics": _compute_arbitrage_metrics(arb_trades),
+        "arbitrage_trades": _build_recent_arbitrage_rows(arb_trades),
+        "db_error": db_error,
+    }
+
+
+@app.route("/")
+def index():
+    payload = _build_dashboard_payload()
     return render_template(
         "dashboard.html",
-        summary=main_data["summary"],
-        positions=main_data["positions"],
-        orders=main_data["orders"],
-        actions=main_data["actions"],
-        recent_trades=main_data["recent_trades"],
-        equity_snapshots=main_data["equity_snapshots"],
-        arbitrage_metrics=arb_metrics,
-        arbitrage_trades=recent_arb_trades,
-        logs=logs,
-        db_error=db_error,
+        summary=payload["summary"],
+        positions=payload["positions"],
+        orders=payload["orders"],
+        actions=payload["actions"],
+        recent_trades=payload["recent_trades"],
+        equity_snapshots=payload["equity_snapshots"],
+        arbitrage_metrics=payload["arbitrage_metrics"],
+        arbitrage_trades=payload["arbitrage_trades"],
+        logs=[],
+        db_error=payload["db_error"],
     )
 
 
@@ -214,6 +233,12 @@ def api_metrics():
     if db_error:
         return jsonify({"ok": False, "error": db_error}), 503
     return jsonify({"ok": True, "data": _serialize_metrics(main_data["summary"])})
+
+
+@app.route("/api/dashboard-state")
+def api_dashboard_state():
+    payload = _build_dashboard_payload()
+    return jsonify({"ok": payload["db_error"] is None, "data": payload})
 
 
 @app.route("/api/positions")
@@ -264,5 +289,39 @@ def api_logs():
     return jsonify({"ok": True, "data": get_logs(20)})
 
 
+@app.route("/api/log-stream")
+def api_log_stream():
+    offset_raw = request.args.get("offset")
+    bootstrap = request.args.get("bootstrap")
+    lines = get_logs(limit=None)
+    total = len(lines)
+
+    if bootstrap == "current" and offset_raw is None:
+        return jsonify({"ok": True, "data": {"lines": [], "next_offset": total, "reset": False}})
+
+    try:
+        offset = max(int(offset_raw or "0"), 0)
+    except ValueError:
+        offset = 0
+
+    reset = offset > total
+    if reset:
+        offset = 0
+
+    return jsonify(
+        {
+            "ok": True,
+            "data": {
+                "lines": lines[offset:],
+                "next_offset": total,
+                "reset": reset,
+            },
+        }
+    )
+
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    _HOST = os.getenv("HOST", "127.0.0.1")
+    _PORT = int(os.getenv("PORT", "5000"))
+    _DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host=_HOST, port=_PORT, debug=_DEBUG)

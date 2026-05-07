@@ -968,7 +968,7 @@ def _resolve_effective_mode_and_trader(
 
 
 class Bot:
-    def __init__(self) -> None:
+    def __init__(self, *, install_signal_handlers: bool = True) -> None:
         self.requested_mode = REQUESTED_MODE
         self.musashi = MusashiClient(BASE_URL)
         self.polymarket_public = PolymarketPublicClient()
@@ -1086,7 +1086,8 @@ class Bot:
                 save_state_callback=self.save_state,
             )
 
-        signal.signal(signal.SIGTERM, self._handle_sigterm)
+        if install_signal_handlers:
+            signal.signal(signal.SIGTERM, self._handle_sigterm)
 
     def _db_write_critical(self, label: str, exc: Exception) -> None:
         """Handle a failed DB write on a path where data loss is unrecoverable.
@@ -3156,7 +3157,7 @@ class Bot:
                     self.process_pending_orders()
                     self.monitor_positions()
                     self.evaluate_live_protection_transition()
-                    feed = self.musashi.get_feed(limit=20, min_urgency="high")
+                    feed = self.musashi.get_feed(limit=20, min_urgency="medium")
                     logger.info("Fetched %d feed items", len(feed))
                     for item in feed:
                         self.handle_feed_item(item)

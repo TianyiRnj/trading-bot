@@ -136,6 +136,99 @@
 - 增加带依赖的测试环境说明（本地 `docker compose up -d postgres`）
 - 增加基于本地 Postgres 的启动与恢复集成测试
 
+## Railway 单服务合并部署方案（2026-05-06）
+
+当前部署目标调整为：优先支持 `Railway`，不再把 `Vercel` 作为整个 trading bot 的主部署目标。
+
+方案摘要：
+
+- 使用 `1` 个 `Railway` Web Service 承载 dashboard 和 bot 运行入口
+- 使用 `1` 个 `Railway PostgreSQL` 服务承载主策略唯一真源
+- dashboard 对外提供 HTTP 访问
+- bot 在同一服务内作为后台线程或同进程后台任务启动
+- 不把“完全免费、24/7 常驻运行”作为该方案的成立前提
+
+这样选的原因：
+
+- 当前 bot 是常驻轮询 + WebSocket + 后台线程模型，更接近 `Railway` 的持久化 service，而不是 `Vercel` 的请求驱动函数模型
+- 当前 dashboard 既读 `Postgres`，也会读本地 `bot/logs/bot.log` 与 `bot/data/arbitrage_trades.jsonl`
+- 如果拆成两个应用服务，本地文件共享会立刻变成额外问题
+- 单服务合并部署可以先把部署复杂度压到最低，再决定是否值得继续拆分
+
+该方案的边界与代价：
+
+- Web 服务重启、重新部署、崩溃时，会连带重启 bot
+- 必须保证云上始终只有一个 bot 实例启动，不能因为 worker / replica 配置导致重复运行
+- 主策略状态仍然必须只以 `Postgres` 为准，不能把本地文件重新变成真源
+- `bot/logs/bot.log` 与 `bot/data/arbitrage_trades.jsonl` 在云环境里只能视为“尽力而为的本地副产物”，不能依赖其跨部署持久化
+- 如果后续坚持“零费用长期在线”，则需要改走自托管路线；当前 `Railway` 方案不以此为目标
+
+本地兼容约束：
+
+- Railway 改造不能替换当前本地开发入口，只能新增云部署入口
+- 本地 `docker compose up -d postgres` 路径必须继续可用
+- 本地 `python3 bot/main.py` 直跑路径必须继续可用
+- 本地 `python3 dashboard.py` 直跑路径必须继续可用
+- 云端使用的 `HOST`、`PORT`、bot 自动启动开关必须通过环境变量控制，并保留适合本地开发的默认值
+
+阶段性成功标准：
+
+- 单个 `Railway` 服务启动后，dashboard 可以对外访问
+- 同一服务启动后，bot 会自动开始扫描并持续写入 `Postgres`
+- `SIGTERM` / 部署重启时，bot 仍沿用现有清理路径
+- dashboard 在不依赖本地旧文件的前提下，仍能展示主策略核心视图
+
+## Railway 下一步修改方案
+
+### Step 1：增加统一云入口
+
+- 新增单一入口文件，例如 `app.py`
+- 该入口负责启动 Flask dashboard，并在后台启动 bot
+- 该入口是新增入口，不替换现有 `bot/main.py` 和 `dashboard.py` 的本地直跑方式
+- 保持当前 `bot/main.py` 的核心逻辑不直接揉进 dashboard 文件，避免把已有模块结构打散
+- 明确 bot 只能启动一次，不能因为模块导入、副本扩容或 worker 机制被重复拉起
+
+### Step 2：把 dashboard 改成可部署的生产入口
+
+- 不再只监听 `127.0.0.1:5000`
+- 改为监听 `0.0.0.0` 和 `PORT`
+- 增加 `healthz` 类健康检查接口，供 `Railway` healthcheck 使用
+- 关闭 `debug=True`
+- 保持当前模板与 JSON API 行为不变，优先减少 UI 层改动
+
+### Step 3：补齐单服务启动保护
+
+- 增加显式环境变量开关，例如是否自动启动 bot
+- 明确部署时只允许单实例 / 单 replica 运行 bot
+- 为后续可能的多实例部署提前标记风险：当前 dashboard 查询、`account_key=main`、本地 sidecar 文件都默认单实例语义
+
+### Step 4：收紧云环境下的存储边界
+
+- 继续坚持主策略只以 `Postgres` 为唯一真源
+- dashboard 对本地日志和 `arbitrage_trades.jsonl` 的读取改成可降级能力，而不是部署前提
+- 如果本地文件缺失，主策略核心 dashboard 仍应正常工作
+- 后续再决定是否把套利 sidecar 数据迁入 `Postgres`，当前不把它作为 Railway 首次上线阻塞项
+
+### Step 5：补齐 Railway 部署资产与运行说明
+
+- 增加 Railway 所需启动方式与部署说明
+- 选择适合单进程单实例语义的 Python Web server 方案，避免多 worker 触发重复 bot
+- 明确 `DATABASE_URL` 直接接 Railway Postgres 提供的连接串
+- 在文档中补齐环境变量、healthcheck、启动命令、以及单实例约束
+
+### Step 6：补齐部署相关测试与验证
+
+- 增加最小化的启动验证，确保统一入口启动时 dashboard 与 bot 都能初始化
+- 增加对 `PORT`、healthcheck、以及 bot 自动启动开关的测试
+- 保留现有本地 `docker compose` + Postgres 验证路径，避免云部署改造破坏本地开发
+
+建议的实际落地顺序：
+
+1. 先改统一入口与 dashboard 监听方式。
+2. 再补 bot 单实例启动保护。
+3. 然后处理本地文件降级与 Railway 启动方式。
+4. 最后更新 `README.md` 与补测试。
+
 ## 本文档维护规则
 
 从现在开始，这份计划只保留三类内容：

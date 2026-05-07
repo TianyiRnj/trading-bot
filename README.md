@@ -10,7 +10,7 @@ To make live operation more practical, the bot also tracks real fills, preserves
 
 The current main strategy is a Musashi-signal-driven Polymarket executor with explicit entry filters, position sizing rules, exit logic, and live-safety controls.
 
-- Signal intake: the main loop fetches high-urgency Musashi feed items, re-analyzes each text with `analyze-text`, and only considers signals that still produce a concrete `YES` or `NO` action with sufficient confidence and edge.
+- Signal intake: the main loop fetches medium-and-higher-urgency Musashi feed items, re-analyzes each text with `analyze-text`, and only considers signals that still produce a concrete `YES` or `NO` action with sufficient confidence and edge.
 - Entry filters: by default, the bot requires `confidence >= 0.76`, `edge >= 0.05`, a Polymarket venue match, `volume24h >= 20000`, and a tradable probability between `0.08` and `0.85`.
 - Market selection: if multiple candidate markets match the same signal, the bot ranks them by a composite score based on Musashi confidence, estimated edge, and market-match confidence, then trades only the top candidate.
 - Position sizing: the bot caps exposure with `BOT_MAX_POSITION_USD`, `BOT_MAX_TOTAL_EXPOSURE_USD`, and the remaining bankroll. Stronger signals receive a larger position tier, and `BOT_LIMIT_ONE_POSITION_PER_EVENT=true` prevents stacking multiple positions on the same event by default.
@@ -122,10 +122,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 docker compose up -d postgres
-python3 bot/main.py
+python3 app.py
 ```
 
-That starts the local database first and then launches the bot with whatever values are currently defined in `.env`, so the next step is to make sure the configuration matches the mode you want to use.
+That starts the local database first and then launches the unified local app with whatever values are currently defined in `.env`. The Flask dashboard stays in the foreground, and the bot starts automatically in a background thread.
 
 ## Configuration
 
@@ -200,17 +200,17 @@ These values control how the bot responds after a position is opened:
 - `BOT_EXIT_ORDER_REPRICE=true` cancels the old exit order, records the timeout/cancel/reprice event chain, and re-lists the remaining shares at an updated price
 - `BOT_STARTUP_RECONCILE=true` performs a geoblock check and reconciles local order state when the bot starts
 
-With the configuration in place, you are ready to run the bot normally.
+With the configuration in place, you are ready to run the local app normally.
 
-## Running the Bot
+## Running Locally
 
-Start the bot from the project root with:
+Start the unified app from the project root with:
 
 ```bash
-python3 bot/main.py
+python3 app.py
 ```
 
-As the bot runs, it writes its main-strategy account state, positions, orders, trade events, seen events, and equity snapshots to Postgres. Text logs still go to `bot/logs/bot.log`.
+The dashboard is available at `http://127.0.0.1:5000`. As the app runs, the bot writes its main-strategy account state, positions, orders, trade events, seen events, and equity snapshots to Postgres. Text logs still go to `bot/logs/bot.log`.
 
 The account model is now mark-to-market:
 
@@ -242,13 +242,19 @@ Install the dashboard dependency if you have not already:
 pip install -r requirements.txt  # includes flask>=3.0.0 and psycopg[binary,pool]
 ```
 
-Run from the project root after Postgres is up and the bot has written some runtime state:
+Run from the project root after Postgres is up:
 
 ```bash
-python3 dashboard.py
+python3 app.py
 ```
 
-The dashboard is available at `http://127.0.0.1:5000`.
+That starts the dashboard and the bot together. The dashboard is available at `http://127.0.0.1:5000`.
+
+Set `HOST` and `PORT` env vars to override the listen address:
+
+```bash
+HOST=0.0.0.0 PORT=8080 python3 app.py
+```
 
 The main strategy page reads:
 
@@ -257,8 +263,12 @@ The main strategy page reads:
 - active orders from `orders`
 - action timeline rows from `trade_events`
 
+The dashboard now refreshes its sections in place every `3` seconds instead of reloading the whole page. The bot log panel is session-local: it starts empty on page load, appends only new lines that appear after you opened the page, keeps growing without a hard UI cap, and clears again when you refresh the browser tab.
+
 The JSON API also exposes:
 
+- `/healthz`
+- `/api/dashboard-state`
 - `/api/metrics`
 - `/api/positions`
 - `/api/orders`
@@ -266,6 +276,7 @@ The JSON API also exposes:
 - `/api/recent-events`
 - `/api/trades`
 - `/api/logs`
+- `/api/log-stream`
 
 If `BOT_ENABLE_ARBITRAGE=true`, the page also shows the existing arbitrage simulation side panel sourced from `bot/data/arbitrage_trades.jsonl`.
 
@@ -310,22 +321,22 @@ The Postgres bootstrap files remain:
 
 ## Running in the Background
 
-If you want the bot to keep running after you close the terminal, start it with `nohup`:
+If you want the local app to keep running after you close the terminal, start it with `nohup`:
 
 ```bash
-nohup ./.venv/bin/python bot/main.py >> bot/logs/nohup.log 2>&1 &
+nohup ./.venv/bin/python app.py >> bot/logs/nohup.log 2>&1 &
 ```
 
-That background process uses the virtual environment directly, which helps ensure the bot keeps running with the same Python interpreter and installed dependencies you used during setup.
+That background process uses the virtual environment directly, which helps ensure the dashboard and bot keep running with the same Python interpreter and installed dependencies you used during setup.
 
 ## Stopping the Bot and Deactivating the Environment
 
-When you are done, the exact shutdown step depends on how you started the bot. If the bot is running in the current terminal, press `Ctrl+C` to stop the process cleanly and return to the shell.
+When you are done, the exact shutdown step depends on how you started the app. If the app is running in the current terminal, press `Ctrl+C` to stop the process cleanly and return to the shell.
 
-If you started the bot in the background with `nohup`, find the process and terminate it explicitly:
+If you started the app in the background with `nohup`, find the process and terminate it explicitly:
 
 ```bash
-ps aux | grep "bot/main.py"
+ps aux | grep "app.py"
 kill <PID>
 ```
 
@@ -335,7 +346,7 @@ If the process does not stop after a normal `kill`, you can force termination wi
 kill -9 <PID>
 ```
 
-`Ctrl+C`, normal process exit, and `kill <PID>` (`SIGTERM`) give the bot a chance to flush its latest Postgres-backed runtime state before shutdown. `kill -9` (`SIGKILL`) does not; for that path the bot can only rely on state that was already written during normal runtime updates.
+`Ctrl+C`, normal process exit, and `kill <PID>` (`SIGTERM`) give the bot thread a chance to flush its latest Postgres-backed runtime state before shutdown. `kill -9` (`SIGKILL`) does not; for that path the bot can only rely on state that was already written during normal runtime updates.
 
 After the bot has stopped, you can leave the virtual environment with:
 
@@ -344,3 +355,48 @@ deactivate
 ```
 
 That returns your shell to the system-level Python environment and completes the local session cleanly.
+
+## Railway Deployment
+
+The repository ships with a unified entry point (`app.py`) and a `railway.toml` that target a single Railway Web Service plus a Railway PostgreSQL add-on.
+
+### How it works
+
+`app.py` imports the Flask dashboard and launches the bot as a background daemon thread in the same process.
+
+### Required environment variables on Railway
+
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` | Railway-provided Postgres connection string (set automatically when you add the PostgreSQL plugin) |
+| `BOT_MODE` | `paper` (default) or `live` |
+| `MUSASHI_API_BASE_URL` | Base URL of the Musashi signal API |
+| `PORT` | HTTP listen port — Railway sets this automatically |
+
+All other bot env vars (`BOT_BANKROLL_USD`, `POLYMARKET_PRIVATE_KEY`, etc.) are optional and fall back to their defaults if not set.
+
+### Single-instance constraint
+
+**The service must run with exactly one replica and one worker.** The `railway.toml` already sets `--workers 1` in the gunicorn start command. Do not scale the service to multiple replicas unless you first redesign bot startup, because each replica would start its own bot thread writing to the same Postgres database.
+
+### Deploying
+
+1. Create a new Railway project and link this repository.
+2. Add the Railway PostgreSQL plugin — Railway will inject `DATABASE_URL` automatically.
+3. Set `BOT_MODE=paper` and any other required env vars in the Railway service settings.
+4. Deploy. Railway will build with nixpacks and run:
+   ```
+   gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app
+   ```
+5. The dashboard becomes publicly accessible at the Railway-assigned URL.
+6. Verify the service is healthy by checking `/healthz`:
+   - Returns `200 {"ok": true}` when the bot thread is alive.
+   - Returns `503 {"ok": false, "reason": "bot_thread_not_alive"}` if the bot thread has died or crashed.
+
+### Local startup
+
+```bash
+python3 app.py
+```
+
+Use `HOST` and `PORT` if you want the local app to listen on a different address or port.

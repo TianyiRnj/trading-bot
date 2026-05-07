@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Musashi Main Strategy Dashboard</title>
-    <meta http-equiv="refresh" content="3">
     <style>
         * {
             box-sizing: border-box;
@@ -286,6 +285,12 @@
             margin-top: 6px;
         }
 
+        .status-row {
+            color: var(--muted);
+            font-size: 0.82rem;
+            margin-top: 10px;
+        }
+
         @media (max-width: 1050px) {
             .split,
             .two-column {
@@ -312,13 +317,11 @@
             </div>
         </div>
 
-        {% if db_error %}
-        <div class="warning">
-            Dashboard could not read Postgres-backed runtime data: {{ db_error }}. The arbitrage side panel and log tail are still available below.
+        <div id="db-warning" class="warning" {% if not db_error %}style="display: none;"{% endif %}>
+            Dashboard could not read Postgres-backed runtime data: <span id="db-warning-message">{{ db_error or "" }}</span>. The arbitrage side panel and live session log stream are still available below.
         </div>
-        {% endif %}
 
-        <div class="grid metrics-grid">
+        <div id="metrics-grid" class="grid metrics-grid">
             <div class="metric-card">
                 <div class="metric-label">Equity</div>
                 <div class="metric-value">{{ "$%.2f"|format(summary.equity or 0) }}</div>
@@ -383,7 +386,7 @@
                     <div class="hint">current account and mode metadata</div>
                 </div>
                 <div class="panel-body">
-                    <div class="details-grid">
+                    <div id="runtime-state-grid" class="details-grid">
                         <div class="detail-card">
                             <span class="label">Account Key</span>
                             <span class="value mono">{{ summary.account_key or "main" }}</span>
@@ -417,7 +420,7 @@
                     <h2>Equity Snapshots</h2>
                     <div class="hint">latest recorded account snapshots</div>
                 </div>
-                <div class="panel-body">
+                <div id="equity-snapshots-body" class="panel-body">
                     {% if equity_snapshots %}
                     <table>
                         <thead>
@@ -452,7 +455,7 @@
                     <h2>Open Positions</h2>
                     <div class="hint">current strategy exposure from positions table</div>
                 </div>
-                <div class="panel-body">
+                <div id="positions-body" class="panel-body">
                     {% if positions %}
                     <table>
                         <thead>
@@ -493,7 +496,7 @@
                     <h2>Open Orders</h2>
                     <div class="hint">quoted exits and other active orders</div>
                 </div>
-                <div class="panel-body">
+                <div id="orders-body" class="panel-body">
                     {% if orders %}
                     <table>
                         <thead>
@@ -534,7 +537,7 @@
                     <h2>Recent Closed Trades</h2>
                     <div class="hint">most recent closed positions</div>
                 </div>
-                <div class="panel-body">
+                <div id="recent-trades-body" class="panel-body">
                     {% if recent_trades %}
                     <table>
                         <thead>
@@ -567,7 +570,7 @@
                     <h2>Action Timeline</h2>
                     <div class="hint">latest trade_events rows</div>
                 </div>
-                <div class="panel-body">
+                <div id="actions-body" class="panel-body">
                     {% if actions %}
                     <table>
                         <thead>
@@ -606,7 +609,7 @@
                     <h2>Arbitrage Sidecar</h2>
                     <div class="hint">still reads bot/data/arbitrage_trades.jsonl</div>
                 </div>
-                <div class="panel-body">
+                <div id="arbitrage-body" class="panel-body">
                     <div class="details-grid" style="margin-bottom: 16px;">
                         <div class="detail-card">
                             <span class="label">Paper Profit</span>
@@ -655,20 +658,527 @@
             <div class="panel">
                 <div class="panel-header">
                     <h2>Bot Logs</h2>
-                    <div class="hint">latest 20 lines from bot/logs/bot.log</div>
+                    <div class="hint">live session stream from bot/logs/bot.log, clears on page refresh</div>
                 </div>
                 <div class="panel-body">
-                    <div class="logs">
-                        {% for log in logs %}
-                        <div class="log-line">{{ log }}</div>
-                        {% endfor %}
-                        {% if not logs %}
-                        <div class="no-data">No log lines available.</div>
-                        {% endif %}
+                    <div id="logs-stream" class="logs">
+                        <div class="no-data">Live session log stream will appear here after the page loads.</div>
                     </div>
+                    <div class="status-row" id="refresh-status">Auto-refreshing dashboard sections every 3 seconds.</div>
                 </div>
             </div>
         </div>
     </div>
+    <script>
+        const POLL_MS = 3000;
+        let logOffset = 0;
+        let dashboardPollBusy = false;
+        let logPollBusy = false;
+
+        function escapeHtml(value) {
+            return String(value ?? "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+        }
+
+        function toNumber(value, fallback = 0) {
+            const parsed = Number(value);
+            return Number.isFinite(parsed) ? parsed : fallback;
+        }
+
+        function formatUsd(value) {
+            return `$${toNumber(value).toFixed(2)}`;
+        }
+
+        function formatPct(value, digits = 2) {
+            return `${toNumber(value).toFixed(digits)}%`;
+        }
+
+        function formatDecimal(value, digits = 4) {
+            return toNumber(value).toFixed(digits);
+        }
+
+        function badge(text, className = "badge-accent") {
+            return `<span class="badge ${className}">${escapeHtml(text || "-")}</span>`;
+        }
+
+        function noData(message) {
+            return `<div class="no-data">${escapeHtml(message)}</div>`;
+        }
+
+        function renderWarning(dbError) {
+            const warning = document.getElementById("db-warning");
+            const warningMessage = document.getElementById("db-warning-message");
+            if (!warning || !warningMessage) {
+                return;
+            }
+            if (dbError) {
+                warning.style.display = "block";
+                warningMessage.textContent = dbError;
+            } else {
+                warning.style.display = "none";
+                warningMessage.textContent = "";
+            }
+        }
+
+        function renderModePill(summary = {}) {
+            const pill = document.querySelector(".mode-pill");
+            if (!pill) {
+                return;
+            }
+            pill.innerHTML = `
+                <span>requested=${escapeHtml(summary.requested_mode || "unknown")}</span>
+                <span>effective=${escapeHtml(summary.effective_mode || "unknown")}</span>
+            `;
+        }
+
+        function renderMetrics(summary = {}) {
+            const metricsGrid = document.getElementById("metrics-grid");
+            if (!metricsGrid) {
+                return;
+            }
+            const totalProfit = toNumber(summary.total_profit);
+            const realizedPnl = toNumber(summary.realized_pnl);
+            const unrealizedPnl = toNumber(summary.unrealized_pnl);
+            const winRate = toNumber(summary.win_rate);
+            metricsGrid.innerHTML = `
+                <div class="metric-card">
+                    <div class="metric-label">Equity</div>
+                    <div class="metric-value">${formatUsd(summary.equity)}</div>
+                    <div class="metric-note">cash plus marked open-position value</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Total PnL</div>
+                    <div class="metric-value ${totalProfit >= 0 ? "positive" : ""}">${formatUsd(totalProfit)}</div>
+                    <div class="metric-note">${formatPct(summary.total_return_pct)} total return</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Cash Balance</div>
+                    <div class="metric-value">${formatUsd(summary.cash_balance)}</div>
+                    <div class="metric-note">available cash tracked in account_state</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Positions Value</div>
+                    <div class="metric-value">${formatUsd(summary.positions_value)}</div>
+                    <div class="metric-note">current marked value of open positions</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Realized PnL</div>
+                    <div class="metric-value ${realizedPnl >= 0 ? "positive" : ""}">${formatUsd(realizedPnl)}</div>
+                    <div class="metric-note">closed trade performance</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Unrealized PnL</div>
+                    <div class="metric-value ${unrealizedPnl >= 0 ? "positive" : ""}">${formatUsd(unrealizedPnl)}</div>
+                    <div class="metric-note">open-position mark-to-market movement</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Open Positions</div>
+                    <div class="metric-value">${toNumber(summary.open_positions)}</div>
+                    <div class="metric-note">${toNumber(summary.closed_positions)} closed positions tracked</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Open / Pending Orders</div>
+                    <div class="metric-value">${toNumber(summary.open_orders)}</div>
+                    <div class="metric-note">${toNumber(summary.pending_orders)} quoted exits still active</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Win Rate</div>
+                    <div class="metric-value ${winRate >= 50 ? "positive" : "warning"}">${formatPct(winRate, 1)}</div>
+                    <div class="metric-note">${toNumber(summary.winning_positions)} winners | avg ${formatUsd(summary.average_closed_pnl)}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Drawdown</div>
+                    <div class="metric-value warning">${formatUsd(summary.drawdown)}</div>
+                    <div class="metric-note">${formatPct(summary.drawdown_pct)} below max equity</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Trade Events</div>
+                    <div class="metric-value">${toNumber(summary.trade_event_count)}</div>
+                    <div class="metric-note">latest action timeline rows in Postgres</div>
+                </div>
+            `;
+        }
+
+        function renderRuntimeState(summary = {}) {
+            const grid = document.getElementById("runtime-state-grid");
+            if (!grid) {
+                return;
+            }
+            const mode = summary.mode || {};
+            grid.innerHTML = `
+                <div class="detail-card">
+                    <span class="label">Account Key</span>
+                    <span class="value mono">${escapeHtml(summary.account_key || "main")}</span>
+                </div>
+                <div class="detail-card">
+                    <span class="label">Initial Bankroll</span>
+                    <span class="value">${formatUsd(summary.initial_bankroll)}</span>
+                </div>
+                <div class="detail-card">
+                    <span class="label">Updated At</span>
+                    <span class="value mono">${escapeHtml(summary.updated_at || "n/a")}</span>
+                </div>
+                <div class="detail-card">
+                    <span class="label">Fallback Reason</span>
+                    <span class="value mono">${escapeHtml(mode.fallback_reason || "none")}</span>
+                </div>
+                <div class="detail-card">
+                    <span class="label">Mode Run Status</span>
+                    <span class="value mono">${escapeHtml(mode.status || "n/a")}</span>
+                </div>
+                <div class="detail-card">
+                    <span class="label">Run Label</span>
+                    <span class="value mono">${escapeHtml(mode.run_label || "n/a")}</span>
+                </div>
+            `;
+        }
+
+        function renderEquitySnapshots(points = []) {
+            const body = document.getElementById("equity-snapshots-body");
+            if (!body) {
+                return;
+            }
+            if (!points.length) {
+                body.innerHTML = noData("No equity snapshots recorded yet.");
+                return;
+            }
+            body.innerHTML = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Captured</th>
+                            <th>Equity</th>
+                            <th>Cash</th>
+                            <th>Positions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${points.map((point) => `
+                            <tr>
+                                <td class="mono">${escapeHtml(point.captured_at || "n/a")}</td>
+                                <td>${formatUsd(point.equity)}</td>
+                                <td>${formatUsd(point.cash_balance)}</td>
+                                <td>${formatUsd(point.positions_value)}</td>
+                            </tr>
+                        `).join("")}
+                    </tbody>
+                </table>
+            `;
+        }
+
+        function renderPositions(positions = []) {
+            const body = document.getElementById("positions-body");
+            if (!body) {
+                return;
+            }
+            if (!positions.length) {
+                body.innerHTML = noData("No open positions right now.");
+                return;
+            }
+            body.innerHTML = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Market</th>
+                            <th>Side</th>
+                            <th>Shares</th>
+                            <th>Entry</th>
+                            <th>Current</th>
+                            <th>Marked Value</th>
+                            <th>Unrealized</th>
+                            <th>Opened</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${positions.map((position) => `
+                            <tr>
+                                <td>${escapeHtml(position.title || position.market_id || "Unknown")}</td>
+                                <td>${badge(position.side)}</td>
+                                <td>${formatDecimal(position.shares)}</td>
+                                <td>${formatDecimal(position.entry_price, 3)}</td>
+                                <td>${formatDecimal(position.current_probability, 3)}</td>
+                                <td>${formatUsd(position.current_value_usd ?? position.entry_value_usd)}</td>
+                                <td>${formatUsd(position.unrealized_pnl)}</td>
+                                <td class="mono">${escapeHtml(position.opened_at || "n/a")}</td>
+                            </tr>
+                        `).join("")}
+                    </tbody>
+                </table>
+            `;
+        }
+
+        function renderOrders(orders = []) {
+            const body = document.getElementById("orders-body");
+            if (!body) {
+                return;
+            }
+            if (!orders.length) {
+                body.innerHTML = noData("No open orders in Postgres.");
+                return;
+            }
+            body.innerHTML = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Order</th>
+                            <th>Status</th>
+                            <th>Mode</th>
+                            <th>Remaining</th>
+                            <th>Requested</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${orders.map((order) => `
+                            <tr>
+                                <td class="mono">${escapeHtml(order.order_id || "-")}</td>
+                                <td>${badge(order.status, order.execution_mode === "quoted_execution" ? "badge-warn" : "badge-accent")}</td>
+                                <td class="mono">${escapeHtml(order.execution_mode || "-")}</td>
+                                <td>${formatDecimal(order.remaining_shares)}</td>
+                                <td>${formatUsd(order.requested_value_usd)}</td>
+                            </tr>
+                        `).join("")}
+                    </tbody>
+                </table>
+            `;
+        }
+
+        function renderRecentTrades(trades = []) {
+            const body = document.getElementById("recent-trades-body");
+            if (!body) {
+                return;
+            }
+            if (!trades.length) {
+                body.innerHTML = noData("No closed trades recorded yet.");
+                return;
+            }
+            body.innerHTML = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Market</th>
+                            <th>Side</th>
+                            <th>Realized PnL</th>
+                            <th>Closed</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${trades.map((trade) => `
+                            <tr>
+                                <td>${escapeHtml(trade.title || trade.market_id || "Unknown")}</td>
+                                <td>${badge(trade.side)}</td>
+                                <td>${formatUsd(trade.realized_pnl)}</td>
+                                <td class="mono">${escapeHtml(trade.closed_at || "n/a")}</td>
+                            </tr>
+                        `).join("")}
+                    </tbody>
+                </table>
+            `;
+        }
+
+        function renderActions(actions = []) {
+            const body = document.getElementById("actions-body");
+            if (!body) {
+                return;
+            }
+            if (!actions.length) {
+                body.innerHTML = noData("No trade events have been recorded yet.");
+                return;
+            }
+            body.innerHTML = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Action</th>
+                            <th>Order</th>
+                            <th>Status</th>
+                            <th>Value</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${actions.slice(0, 20).map((action) => `
+                            <tr>
+                                <td class="mono">${escapeHtml(action.created_at || "n/a")}</td>
+                                <td>${badge(action.action_type)}</td>
+                                <td class="mono">${escapeHtml(action.order_id || "-")}</td>
+                                <td class="mono">${escapeHtml(action.status || "-")}</td>
+                                <td>${formatUsd(action.executed_value_usd ?? action.requested_value_usd)}</td>
+                                <td class="mono">${escapeHtml(action.reason || "-")}</td>
+                            </tr>
+                        `).join("")}
+                    </tbody>
+                </table>
+            `;
+        }
+
+        function renderArbitrage(payload = {}) {
+            const body = document.getElementById("arbitrage-body");
+            if (!body) {
+                return;
+            }
+            const metrics = payload.arbitrage_metrics || {};
+            const trades = payload.arbitrage_trades || [];
+            const tableHtml = trades.length
+                ? `
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Market</th>
+                                <th>Route</th>
+                                <th>Profit</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${trades.map((trade) => `
+                                <tr>
+                                    <td class="mono">${escapeHtml(trade.time || "n/a")}</td>
+                                    <td>${escapeHtml(trade.title || "Unknown")}</td>
+                                    <td class="mono">${escapeHtml(trade.buy_platform || "unknown")} -> ${escapeHtml(trade.sell_platform || "unknown")}</td>
+                                    <td>${formatUsd(trade.profit)}</td>
+                                </tr>
+                            `).join("")}
+                        </tbody>
+                    </table>
+                `
+                : noData("No arbitrage simulation trades recorded.");
+
+            body.innerHTML = `
+                <div class="details-grid" style="margin-bottom: 16px;">
+                    <div class="detail-card">
+                        <span class="label">Paper Profit</span>
+                        <span class="value">${formatUsd(metrics.total_profit)}</span>
+                    </div>
+                    <div class="detail-card">
+                        <span class="label">Trades</span>
+                        <span class="value">${toNumber(metrics.arb_count)}</span>
+                    </div>
+                    <div class="detail-card">
+                        <span class="label">Win Rate</span>
+                        <span class="value">${formatPct(metrics.win_rate, 1)}</span>
+                    </div>
+                    <div class="detail-card">
+                        <span class="label">Avg Spread</span>
+                        <span class="value">${formatPct(metrics.avg_spread)}</span>
+                    </div>
+                </div>
+                ${tableHtml}
+            `;
+        }
+
+        function renderRefreshStatus(text) {
+            const el = document.getElementById("refresh-status");
+            if (el) {
+                el.textContent = text;
+            }
+        }
+
+        function renderLogPlaceholder() {
+            const logsEl = document.getElementById("logs-stream");
+            if (!logsEl || logsEl.children.length > 0) {
+                return;
+            }
+            logsEl.innerHTML = noData("Waiting for new log lines in this browser session.");
+        }
+
+        function appendLogLines(lines, reset) {
+            const logsEl = document.getElementById("logs-stream");
+            if (!logsEl) {
+                return;
+            }
+            const stickToBottom = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight < 24;
+            if (reset) {
+                logsEl.innerHTML = "";
+            }
+            if (lines.length === 0) {
+                if (!logsEl.children.length) {
+                    renderLogPlaceholder();
+                }
+                return;
+            }
+            const noDataEl = logsEl.querySelector(".no-data");
+            if (noDataEl) {
+                noDataEl.remove();
+            }
+            lines.forEach((line) => {
+                const row = document.createElement("div");
+                row.className = "log-line";
+                row.textContent = line;
+                logsEl.appendChild(row);
+            });
+            if (stickToBottom) {
+                logsEl.scrollTop = logsEl.scrollHeight;
+            }
+        }
+
+        async function refreshDashboardState() {
+            if (dashboardPollBusy) {
+                return;
+            }
+            dashboardPollBusy = true;
+            try {
+                const response = await fetch("/api/dashboard-state", { cache: "no-store" });
+                const payload = await response.json();
+                const data = payload.data || {};
+                renderWarning(data.db_error || null);
+                renderModePill(data.summary || {});
+                renderMetrics(data.summary || {});
+                renderRuntimeState(data.summary || {});
+                renderEquitySnapshots(data.equity_snapshots || []);
+                renderPositions(data.positions || []);
+                renderOrders(data.orders || []);
+                renderRecentTrades(data.recent_trades || []);
+                renderActions(data.actions || []);
+                renderArbitrage(data);
+                renderRefreshStatus(`Auto-refreshing dashboard sections every ${POLL_MS / 1000} seconds.`);
+            } catch (error) {
+                console.error("dashboard refresh failed", error);
+                renderRefreshStatus("Dashboard refresh failed temporarily; retrying automatically.");
+            } finally {
+                dashboardPollBusy = false;
+            }
+        }
+
+        async function initializeLogStream() {
+            try {
+                const response = await fetch("/api/log-stream?bootstrap=current", { cache: "no-store" });
+                const payload = await response.json();
+                logOffset = payload.data?.next_offset || 0;
+                renderLogPlaceholder();
+            } catch (error) {
+                console.error("log stream bootstrap failed", error);
+                renderRefreshStatus("Log stream bootstrap failed temporarily; retrying automatically.");
+            }
+        }
+
+        async function refreshLogStream() {
+            if (logPollBusy) {
+                return;
+            }
+            logPollBusy = true;
+            try {
+                const response = await fetch(`/api/log-stream?offset=${logOffset}`, { cache: "no-store" });
+                const payload = await response.json();
+                const data = payload.data || {};
+                appendLogLines(data.lines || [], Boolean(data.reset));
+                logOffset = data.next_offset || logOffset;
+            } catch (error) {
+                console.error("log stream refresh failed", error);
+            } finally {
+                logPollBusy = false;
+            }
+        }
+
+        document.addEventListener("DOMContentLoaded", async () => {
+            await initializeLogStream();
+            window.setInterval(refreshDashboardState, POLL_MS);
+            window.setInterval(refreshLogStream, POLL_MS);
+        });
+    </script>
 </body>
 </html>
