@@ -26,6 +26,10 @@ except ImportError:
     from bot.db import init_pool, close_pool, get_db, check_db_available  # package path
     from bot.db import check_db_schema_ready                              # package path
     import bot.repository as repo                                          # package path
+try:
+    from market_intelligence import MusashiInfraClient, score_market_context
+except ImportError:
+    from bot.market_intelligence import MusashiInfraClient, score_market_context
 
 load_dotenv()
 
@@ -33,7 +37,7 @@ BASE_URL = os.getenv("MUSASHI_API_BASE_URL", "https://musashi-api.vercel.app").r
 REQUESTED_MODE = os.getenv("BOT_MODE", "paper").strip().lower()
 ACCOUNT_KEY = "main"
 PAPER_GEO_STRICT = os.getenv("BOT_PAPER_GEO_STRICT", "false").lower() == "true"
-SCAN_INTERVAL_SECONDS = int(os.getenv("BOT_SCAN_INTERVAL_SECONDS", "45"))
+SCAN_INTERVAL_SECONDS = int(os.getenv("BOT_SCAN_INTERVAL_SECONDS", "60"))
 MIN_CONFIDENCE = float(os.getenv("BOT_MIN_CONFIDENCE", "0.76"))
 MIN_EDGE = float(os.getenv("BOT_MIN_EDGE", "0.05"))
 MIN_VOLUME_24H = float(os.getenv("BOT_MIN_VOLUME_24H", "20000"))
@@ -51,6 +55,7 @@ EXIT_ORDER_TIMEOUT_SECONDS = int(os.getenv("BOT_EXIT_ORDER_TIMEOUT_SECONDS", "12
 EXIT_ORDER_REPRICE = os.getenv("BOT_EXIT_ORDER_REPRICE", "true").lower() == "true"
 STARTUP_RECONCILE = os.getenv("BOT_STARTUP_RECONCILE", "true").lower() == "true"
 BOT_ENABLE_ARBITRAGE = os.getenv("BOT_ENABLE_ARBITRAGE", "false").lower() == "true"
+BOT_ARB_SCAN_INTERVAL_SECONDS = max(1, int(os.getenv("BOT_ARB_SCAN_INTERVAL_SECONDS", "30")))
 POLYMARKET_WS_ENABLED = os.getenv("POLYMARKET_WS_ENABLED", "true").lower() == "true"
 RESTRICTED_COUNTRIES = {
     item.strip().upper()
@@ -69,6 +74,11 @@ MUSASHI_READ_TIMEOUT_SECONDS = float(os.getenv("MUSASHI_READ_TIMEOUT_SECONDS", "
 POSTGRES_POOL_MIN = int(os.getenv("POSTGRES_POOL_MIN", "1"))
 POSTGRES_POOL_MAX = int(os.getenv("POSTGRES_POOL_MAX", "5"))
 POSTGRES_CONNECT_TIMEOUT_SECONDS = float(os.getenv("POSTGRES_CONNECT_TIMEOUT_SECONDS", "10"))
+BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK = os.getenv("BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK", "true").lower() == "true"
+BOT_INFRA_MAX_SNAPSHOT_AGE_MINUTES = int(os.getenv("BOT_INFRA_MAX_SNAPSHOT_AGE_MINUTES", "180"))
+MUSASHI_INFRA_SUPABASE_URL = os.getenv("MUSASHI_INFRA_SUPABASE_URL", "").strip()
+MUSASHI_INFRA_SUPABASE_KEY = os.getenv("MUSASHI_INFRA_SUPABASE_KEY", "").strip()
+MUSASHI_INFRA_TIMEOUT_SECONDS = float(os.getenv("MUSASHI_INFRA_TIMEOUT_SECONDS", "10"))
 
 POLYMARKET_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com").rstrip("/")
 POLYMARKET_CHAIN_ID = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
@@ -600,6 +610,7 @@ class Decision:
     signal_type: str | None
     probability: float
     score: float
+    infra_context: dict[str, Any] | None = None
 
 
 @dataclass
@@ -974,6 +985,14 @@ class Bot:
         self.polymarket_public = PolymarketPublicClient()
         self.geolocation = GeolocationClient()
         self.gamma = PolymarketGammaClient()
+        self.market_intelligence = MusashiInfraClient(
+            supabase_url=MUSASHI_INFRA_SUPABASE_URL,
+            api_key=MUSASHI_INFRA_SUPABASE_KEY,
+            timeout=MUSASHI_INFRA_TIMEOUT_SECONDS,
+            enable_market_intelligence=True,
+            enable_arbitrage_fallback=BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK,
+            max_snapshot_age_minutes=BOT_INFRA_MAX_SNAPSHOT_AGE_MINUTES,
+        )
 
         self.startup_geo_profile: dict[str, str] | None = None
         self._shutdown_requested = False
@@ -1025,6 +1044,15 @@ class Bot:
                 "Degrading from live to paper mode. fallback_reason=%s",
                 self.fallback_reason,
             )
+        if self.market_intelligence.market_intelligence_enabled():
+            logger.info("musashi-infra market intelligence enabled via Supabase")
+        if BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK and BOT_ENABLE_ARBITRAGE and not self.market_intelligence.is_configured():
+            logger.warning(
+                "BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK=true but musashi-infra Supabase credentials are missing; "
+                "continuing without arbitrage fallback"
+            )
+        elif self.market_intelligence.arbitrage_fallback_enabled() and BOT_ENABLE_ARBITRAGE:
+            logger.info("musashi-infra arbitrage fallback enabled via Supabase")
 
         run_label = os.getenv("BOT_RUN_LABEL", "default")
         try:
@@ -1084,6 +1112,8 @@ class Bot:
                 trader=self.trader,
                 positions=self.positions,
                 save_state_callback=self.save_state,
+                market_intelligence=self.market_intelligence,
+                scan_interval=BOT_ARB_SCAN_INTERVAL_SECONDS,
             )
 
         if install_signal_handlers:
@@ -1514,6 +1544,14 @@ class Bot:
             return None
 
         ranked_markets = []
+        polymarket_candidates = [
+            market
+            for match in matches
+            if isinstance(match, dict) and isinstance(market := match.get("market"), dict)
+            and market.get("platform") == "polymarket"
+        ]
+        infra_contexts = self.market_intelligence.get_polymarket_contexts(polymarket_candidates)
+
         for match in matches:
             market = match.get("market", {})
             if market.get("platform") != "polymarket":
@@ -1523,14 +1561,31 @@ class Bot:
                 continue
             if probability <= MIN_PRICE or probability >= MAX_PRICE:
                 continue
-            score = float(action["confidence"]) * float(action["edge"]) * max(float(match.get("confidence", 0.5)), 0.25)
-            ranked_markets.append((score, market))
+            base_score = (
+                float(action["confidence"])
+                * float(action["edge"])
+                * max(float(match.get("confidence", 0.5)), 0.25)
+            )
+            infra_context = infra_contexts.get(str(market.get("id")))
+            score_multiplier, score_reasons = score_market_context(
+                infra_context,
+                str(action["direction"]),
+                BOT_INFRA_MAX_SNAPSHOT_AGE_MINUTES,
+            )
+            if infra_context:
+                infra_context = {
+                    **infra_context,
+                    "score_multiplier": score_multiplier,
+                    "score_reasons": score_reasons,
+                }
+            score = base_score * score_multiplier
+            ranked_markets.append((score, market, infra_context))
 
         if not ranked_markets:
             return None
 
         ranked_markets.sort(key=lambda item: item[0], reverse=True)
-        score, best_market = ranked_markets[0]
+        score, best_market, best_infra_context = ranked_markets[0]
         return Decision(
             event_id=str(event_id),
             market=best_market,
@@ -1542,6 +1597,7 @@ class Bot:
             signal_type=signal_payload.get("signal_type"),
             probability=current_probability(best_market, str(action["direction"])),
             score=score,
+            infra_context=best_infra_context,
         )
 
     def size_position(self, decision: Decision) -> float:
@@ -1788,6 +1844,8 @@ class Bot:
             "requested_mode": self.requested_mode,
             "effective_mode": self.effective_mode,
         }
+        if decision.infra_context:
+            position["infra_context"] = decision.infra_context
         self.positions[market_id] = position
         self.save_state()
 
@@ -3097,6 +3155,8 @@ class Bot:
     def _handle_sigterm(self, signum: int, frame: Any) -> None:
         logger.info("SIGTERM received — initiating clean shutdown")
         self._shutdown_requested = True
+        if self.arbitrage_strategy is not None:
+            self.arbitrage_strategy.stop()
 
     def _shutdown(self, reason: str = "normal") -> None:
         self.persist_runtime_state(reason=reason)
@@ -3195,6 +3255,10 @@ class Bot:
             shutdown_reason = "keyboard_interrupt"
             raise
         finally:
+            if self.arbitrage_strategy is not None:
+                self.arbitrage_strategy.stop()
+            if self.arbitrage_thread is not None and self.arbitrage_thread.is_alive():
+                self.arbitrage_thread.join(timeout=15)
             self._shutdown(reason=shutdown_reason)
             self.market_stream.stop()
             if self.user_stream:

@@ -138,6 +138,53 @@ Two optional runtime flags are also available:
 - `BOT_PAPER_GEO_STRICT=false` keeps paper mode geolocation checks advisory instead of fatal
 - `BOT_RUN_LABEL=default` tags each runtime row written to `mode_state`
 
+### Optional musashi-infra Supabase Context
+
+The bot can optionally read `musashi-infra`'s Supabase tables as a **read-only**
+market-intelligence layer. This is independent from the local Postgres runtime
+used for orders, positions, and account state.
+
+Set the following in `.env` only if you want that extra context:
+
+```bash
+BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK=true
+BOT_INFRA_MAX_SNAPSHOT_AGE_MINUTES=180
+MUSASHI_INFRA_SUPABASE_URL=
+MUSASHI_INFRA_SUPABASE_KEY=
+MUSASHI_INFRA_TIMEOUT_SECONDS=10
+```
+
+What the read-only integration does today:
+
+- enriches Polymarket candidate ranking with `musashi-infra` liquidity, freshness, and 24-hour snapshot momentum when matching Supabase rows exist
+- stores the selected infra context in the local position metadata for later debugging
+- gives the arbitrage scanner a direct Supabase fallback if the Musashi API arbitrage endpoint is empty or unavailable, using the freshest available `last_snapshot_at` or `last_ingested_at` timestamp to filter stale rows
+
+The current Python integration reads from these `musashi-infra` tables:
+
+- `markets`
+- `market_snapshots`
+- `source_health`
+
+If the Supabase credentials are omitted, the bot keeps its existing behavior and simply skips the optional enrichment.
+
+Run the local test suite with:
+
+```bash
+./.venv/bin/python3 -m pytest
+```
+
+To run the live Supabase smoke test against the configured `musashi-infra`
+project:
+
+```bash
+./.venv/bin/python3 -m pytest tests/test_supabase_smoke.py
+```
+
+That test does real read-only checks against the configured Supabase REST API
+and verifies that `source_health`, `markets`, and Polymarket context lookups are
+reachable. If the Supabase credentials are missing, the live smoke tests skip automatically.
+
 ### Paper Trading
 
 To stay in paper mode, keep the following setting:
@@ -210,7 +257,7 @@ Start the unified app from the project root with:
 python3 app.py
 ```
 
-The dashboard is available at `http://127.0.0.1:5000`. As the app runs, the bot writes its main-strategy account state, positions, orders, trade events, seen events, and equity snapshots to Postgres. Text logs still go to `bot/logs/bot.log`.
+The dashboard is available at `http://127.0.0.1:5001`. As the app runs, the bot writes its main-strategy account state, positions, orders, trade events, seen events, and equity snapshots to Postgres. Text logs still go to `bot/logs/bot.log`.
 
 The account model is now mark-to-market:
 
@@ -232,6 +279,12 @@ BOT_ENABLE_ARBITRAGE=true
 
 When enabled, the scanner runs as a background thread alongside the main Musashi signal loop and writes simulated trade records to `bot/data/arbitrage_trades.jsonl`.
 
+Its default source is the Musashi API `/api/markets/arbitrage` endpoint. If you also configure the optional `musashi-infra` Supabase credentials and keep `BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK=true`, the scanner can fall back to direct `markets` table reads when the API response is empty or unavailable.
+
+Two additional optional runtime flags are available for the arbitrage sidecar:
+
+- `BOT_ARB_SCAN_INTERVAL_SECONDS=30` controls how often the arbitrage scanner polls the Musashi API. It is independent of `BOT_SCAN_INTERVAL_SECONDS` (the main strategy loop). The minimum effective value is `1`.
+
 ## Main Strategy Dashboard (Flask)
 
 A lightweight Flask dashboard displays the main strategy from Postgres and keeps the arbitrage simulation as a clearly labeled side panel.
@@ -248,7 +301,7 @@ Run from the project root after Postgres is up:
 python3 app.py
 ```
 
-That starts the dashboard and the bot together. The dashboard is available at `http://127.0.0.1:5000`.
+That starts the dashboard and the bot together. The dashboard is available at `http://127.0.0.1:5001`.
 
 Set `HOST` and `PORT` env vars to override the listen address:
 

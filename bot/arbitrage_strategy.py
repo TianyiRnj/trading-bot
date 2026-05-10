@@ -7,9 +7,10 @@ placement is implemented; all "executed" trades are paper entries only.
 """
 import json
 import logging
-import time
+import threading
+from collections import OrderedDict
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from dataclasses import dataclass
 
 try:
@@ -22,7 +23,6 @@ logger = logging.getLogger("arbitrage")
 # Arbitrage parameters
 MIN_SPREAD_PERCENT = 0.05   # 5% minimum spread to log an opportunity
 POSITION_SIZE_USD = 10.0    # $10 per leg (total $20 simulated exposure)
-SCAN_INTERVAL_SECONDS = 5   # seconds between API polls
 MIN_VOLUME_USD = 500        # $500 minimum 24h volume — Kalshi political markets often report $0 24h volume
 
 _ARB_TRADES_FILE = Path(__file__).parent / "data" / "arbitrage_trades.jsonl"
@@ -96,6 +96,71 @@ def _parse_opportunity(
     )
 
 
+def _select_primary_market(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        raise ValueError("_select_primary_market requires at least one row")
+
+    def sort_key(row: dict[str, Any]) -> tuple[float, float, float, str]:
+        liquidity = float(row.get("liquidity") or -1)
+        open_interest = float(row.get("open_interest") or -1)
+        volume_24h = float(row.get("volume_24h") or 0)
+        platform_id = str(row.get("platform_id") or row.get("id") or "")
+        return (liquidity, open_interest, volume_24h, platform_id)
+
+    return sorted(rows, key=sort_key, reverse=True)[0]
+
+
+def _derive_opportunities_from_market_rows(
+    rows: list[dict[str, Any]],
+    min_spread: float = MIN_SPREAD_PERCENT,
+    min_volume: float = MIN_VOLUME_USD,
+) -> list[ArbitrageOpportunity]:
+    grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+    for row in rows:
+        event_id = str(row.get("event_id") or "").strip()
+        series_id = str(row.get("series_id") or "").strip()
+        cluster_id = event_id or (f"series:{series_id}" if series_id else "")
+        platform = str(row.get("platform") or "").strip().lower()
+        if not cluster_id or platform not in {"polymarket", "kalshi"}:
+            continue
+
+        bucket = grouped.setdefault(cluster_id, {"polymarket": [], "kalshi": []})
+        bucket[platform].append(row)
+
+    opportunities: list[ArbitrageOpportunity] = []
+    for bucket in grouped.values():
+        if not bucket["polymarket"] or not bucket["kalshi"]:
+            continue
+
+        poly = _select_primary_market(bucket["polymarket"])
+        kalshi = _select_primary_market(bucket["kalshi"])
+        candidate = {
+            "polymarket": {
+                "id": poly.get("platform_id") or poly.get("id"),
+                "title": poly.get("title"),
+                "yesPrice": float(poly.get("yes_price") or 0),
+                "volume24h": float(poly.get("volume_24h") or 0),
+            },
+            "kalshi": {
+                "id": kalshi.get("platform_id") or kalshi.get("id"),
+                "title": kalshi.get("title"),
+                "yesPrice": float(kalshi.get("yes_price") or 0),
+                "volume24h": float(kalshi.get("volume_24h") or 0),
+            },
+        }
+        opportunity = _parse_opportunity(candidate, min_spread=min_spread, min_volume=min_volume)
+        if opportunity is not None:
+            opportunities.append(opportunity)
+
+    opportunities.sort(key=lambda item: item.profit_usd, reverse=True)
+    return opportunities
+
+
+def _arb_key(opportunity: ArbitrageOpportunity) -> str:
+    return f"{opportunity.poly_market_id}:{opportunity.kalshi_market_id}"
+
+
 class ArbitrageStrategy:
     """
     Cross-platform arbitrage scanner — simulation only.
@@ -105,15 +170,63 @@ class ArbitrageStrategy:
     are placed on Kalshi.
     """
 
-    def __init__(self, gamma_client, musashi_client, trader, positions, save_state_callback):
+    def __init__(
+        self,
+        gamma_client,
+        musashi_client,
+        trader,
+        positions,
+        save_state_callback,
+        market_intelligence=None,
+        scan_interval: int = 30,
+    ):
         self.gamma = gamma_client
         self.musashi = musashi_client
         self.trader = trader
         self.positions = positions
         self.save_state = save_state_callback
-        self.executed_arbs: set[str] = set()
+        self.market_intelligence = market_intelligence
+        self.scan_interval = max(1, int(scan_interval))
+        self.executed_arbs: OrderedDict[str, None] = OrderedDict()
+        self._stop_event = threading.Event()
         self.total_profit = 0.0
         self.arb_count = 0
+
+    def stop(self) -> None:
+        """Signal the scanner loop to exit on the next iteration."""
+        self._stop_event.set()
+
+    def _mark_executed(self, key: str) -> None:
+        """Record key as executed and evict oldest entries if the dedup set is too large."""
+        self.executed_arbs[key] = None
+        if len(self.executed_arbs) > 500:
+            for _ in range(250):
+                self.executed_arbs.popitem(last=False)
+
+    def _fallback_opportunities(self) -> list[ArbitrageOpportunity]:
+        if self.market_intelligence is None:
+            return []
+
+        rows = self.market_intelligence.list_cross_platform_markets(min_volume=MIN_VOLUME_USD)
+        if not rows:
+            return []
+
+        opportunities = _derive_opportunities_from_market_rows(
+            rows,
+            min_spread=MIN_SPREAD_PERCENT,
+            min_volume=MIN_VOLUME_USD,
+        )
+        opportunities = [
+            opportunity
+            for opportunity in opportunities
+            if _arb_key(opportunity) not in self.executed_arbs
+        ]
+        if opportunities:
+            logger.info(
+                "Using musashi-infra Supabase fallback for arbitrage discovery (%d opportunity/ies)",
+                len(opportunities),
+            )
+        return opportunities
 
     def find_arbitrage_opportunities(self) -> list[ArbitrageOpportunity]:
         """Poll Musashi API and return filtered ArbitrageOpportunity list."""
@@ -122,11 +235,11 @@ class ArbitrageStrategy:
 
             if not response or not response.get("success"):
                 logger.debug("No arbitrage data from Musashi")
-                return []
+                return self._fallback_opportunities()
 
             raw_opps = response.get("data", {}).get("opportunities", [])
             if not raw_opps:
-                return []
+                return self._fallback_opportunities()
 
             opportunities: list[ArbitrageOpportunity] = []
             for arb in raw_opps:
@@ -135,8 +248,7 @@ class ArbitrageStrategy:
                     if opp is None:
                         continue
 
-                    arb_key = f"{opp.poly_market_id}:{opp.kalshi_market_id}"
-                    if arb_key in self.executed_arbs:
+                    if _arb_key(opp) in self.executed_arbs:
                         continue
 
                     opportunities.append(opp)
@@ -144,11 +256,11 @@ class ArbitrageStrategy:
                     logger.debug("Error parsing arbitrage entry: %s", exc)
 
             opportunities.sort(key=lambda x: x.profit_usd, reverse=True)
-            return opportunities
+            return opportunities or self._fallback_opportunities()
 
         except Exception as exc:
             logger.error("Failed to find arbitrage: %s", exc)
-            return []
+            return self._fallback_opportunities()
 
     def execute_arbitrage(self, opportunity: ArbitrageOpportunity) -> None:
         """Log a simulation-only arbitrage trade and record it to disk."""
@@ -164,8 +276,7 @@ class ArbitrageStrategy:
             logger.info("Simulated profit: $%.2f", opportunity.profit_usd)
             logger.info("=" * 70)
 
-            arb_key = f"{opportunity.poly_market_id}:{opportunity.kalshi_market_id}"
-            self.executed_arbs.add(arb_key)
+            self._mark_executed(_arb_key(opportunity))
 
             buy_price = (
                 opportunity.poly_price
@@ -243,12 +354,12 @@ class ArbitrageStrategy:
         logger.info("ARBITRAGE SCANNER STARTED (simulation only)")
         logger.info("Min spread:     %.0f%%", MIN_SPREAD_PERCENT * 100)
         logger.info("Position size:  $%.0f per leg", POSITION_SIZE_USD)
-        logger.info("Scan interval:  %ds", SCAN_INTERVAL_SECONDS)
+        logger.info("Scan interval:  %ds", self.scan_interval)
         logger.info("Platforms:      Polymarket <-> Kalshi")
         logger.info("NOTE: No real orders are placed. All trades are paper-only.")
         logger.info("=" * 70)
 
-        while True:
+        while not self._stop_event.is_set():
             try:
                 opportunities = self.find_arbitrage_opportunities()
                 if opportunities:
@@ -257,13 +368,8 @@ class ArbitrageStrategy:
                 else:
                     logger.debug("No arbitrage opportunities found this scan")
 
-                # Cap dedup set to avoid unbounded growth
-                if len(self.executed_arbs) > 500:
-                    for key in list(self.executed_arbs)[:250]:
-                        self.executed_arbs.discard(key)
-
-                time.sleep(SCAN_INTERVAL_SECONDS)
+                self._stop_event.wait(self.scan_interval)
 
             except Exception as exc:
                 logger.exception("Arbitrage scanner error: %s", exc)
-                time.sleep(10)
+                self._stop_event.wait(10)

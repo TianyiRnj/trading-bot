@@ -1,8 +1,9 @@
 import importlib
 import os
 import sys
-import unittest
 from unittest.mock import patch
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -13,6 +14,12 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on local env
     _DASHBOARD_IMPORT_ERROR = exc
 else:
     _DASHBOARD_IMPORT_ERROR = None
+
+
+pytestmark = pytest.mark.skipif(
+    dashboard is None,
+    reason=f"dashboard import unavailable: {_DASHBOARD_IMPORT_ERROR}",
+)
 
 
 def _sample_main_payload():
@@ -108,150 +115,153 @@ def _sample_main_payload():
     }
 
 
-@unittest.skipIf(dashboard is None, f"dashboard import unavailable: {_DASHBOARD_IMPORT_ERROR}")
-class TestDashboard(unittest.TestCase):
-    def setUp(self) -> None:
-        self.dashboard = importlib.import_module("dashboard")
-        self.client = self.dashboard.app.test_client()
-
-    @patch("dashboard._load_main_dashboard_data")
-    def test_metrics_endpoint_returns_summary(self, mock_loader):
-        mock_loader.return_value = (_sample_main_payload(), None)
-
-        response = self.client.get("/api/metrics")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["data"]["requested_mode"], "paper")
-        self.assertEqual(payload["data"]["open_positions"], 1)
-        self.assertAlmostEqual(payload["data"]["equity"], 10.6)
-        self.assertAlmostEqual(payload["data"]["total_return_pct"], 8.0)
-        self.assertAlmostEqual(payload["data"]["drawdown_pct"], 1.85)
-
-    @patch("dashboard._load_main_dashboard_data")
-    def test_actions_endpoint_returns_service_unavailable_on_db_error(self, mock_loader):
-        mock_loader.return_value = (
-            {
-                "summary": {},
-                "positions": [],
-                "orders": [],
-                "actions": [],
-                "recent_trades": [],
-                "equity_snapshots": [],
-            },
-            "db unavailable",
-        )
-
-        response = self.client.get("/api/actions")
-
-        self.assertEqual(response.status_code, 503)
-        payload = response.get_json()
-        self.assertFalse(payload["ok"])
-        self.assertIn("db unavailable", payload["error"])
-
-    @patch("dashboard._load_main_dashboard_data")
-    def test_recent_events_endpoint_aliases_actions(self, mock_loader):
-        mock_loader.return_value = (_sample_main_payload(), None)
-
-        response = self.client.get("/api/recent-events")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["data"][0]["action_type"], "buy_filled")
-
-    @patch("dashboard.load_arbitrage_trades")
-    @patch("dashboard._load_main_dashboard_data")
-    def test_dashboard_state_endpoint_returns_combined_payload(self, mock_loader, mock_arb):
-        mock_loader.return_value = (_sample_main_payload(), None)
-        mock_arb.return_value = [
-            {
-                "opened_at": "2026-05-04T18:05:00+00:00",
-                "title": "Arb example",
-                "buy_platform": "Polymarket",
-                "sell_platform": "Kalshi",
-                "buy_price": 0.48,
-                "sell_price": 0.51,
-                "spread_percent": 0.03,
-                "realized_pnl": 1.25,
-            }
-        ]
-
-        response = self.client.get("/api/dashboard-state")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["data"]["summary"]["requested_mode"], "paper")
-        self.assertEqual(payload["data"]["positions"][0]["position_id"], "pos-1")
-        self.assertEqual(payload["data"]["arbitrage_trades"][0]["title"], "Arb example")
-
-    @patch("dashboard._load_main_dashboard_data")
-    def test_dashboard_state_endpoint_keeps_200_on_db_error(self, mock_loader):
-        mock_loader.return_value = (
-            {
-                "summary": {},
-                "positions": [],
-                "orders": [],
-                "actions": [],
-                "recent_trades": [],
-                "equity_snapshots": [],
-            },
-            "db unavailable",
-        )
-
-        response = self.client.get("/api/dashboard-state")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertFalse(payload["ok"])
-        self.assertEqual(payload["data"]["db_error"], "db unavailable")
-
-    @patch("dashboard.get_logs")
-    def test_log_stream_bootstrap_current_skips_existing_lines(self, mock_logs):
-        mock_logs.return_value = ["line 1", "line 2", "line 3"]
-
-        response = self.client.get("/api/log-stream?bootstrap=current")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["data"]["lines"], [])
-        self.assertEqual(payload["data"]["next_offset"], 3)
-        self.assertFalse(payload["data"]["reset"])
-
-    @patch("dashboard.get_logs")
-    def test_log_stream_returns_incremental_lines(self, mock_logs):
-        mock_logs.return_value = ["line 1", "line 2", "line 3"]
-
-        response = self.client.get("/api/log-stream?offset=1")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertEqual(payload["data"]["lines"], ["line 2", "line 3"])
-        self.assertEqual(payload["data"]["next_offset"], 3)
-        self.assertFalse(payload["data"]["reset"])
-
-    @patch("dashboard.get_logs")
-    @patch("dashboard.load_arbitrage_trades")
-    @patch("dashboard._load_main_dashboard_data")
-    def test_index_renders_main_strategy_sections(self, mock_loader, mock_arb, mock_logs):
-        mock_loader.return_value = (_sample_main_payload(), None)
-        mock_arb.return_value = []
-        mock_logs.return_value = ["example log line"]
-
-        response = self.client.get("/")
-        html = response.get_data(as_text=True)
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("Musashi Main Strategy", html)
-        self.assertIn("Open Positions", html)
-        self.assertIn("Action Timeline", html)
-        self.assertIn("Arbitrage Sidecar", html)
-        self.assertIn("Total PnL", html)
-        self.assertIn("Drawdown", html)
+@pytest.fixture()
+def dashboard_client():
+    dashboard_mod = importlib.import_module("dashboard")
+    return dashboard_mod.app.test_client()
 
 
-if __name__ == "__main__":
-    unittest.main()
+@patch("dashboard._load_main_dashboard_data")
+def test_metrics_endpoint_returns_summary(mock_loader, dashboard_client):
+    mock_loader.return_value = (_sample_main_payload(), None)
+
+    response = dashboard_client.get("/api/metrics")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["data"]["requested_mode"] == "paper"
+    assert payload["data"]["open_positions"] == 1
+    assert payload["data"]["equity"] == 10.6
+    assert payload["data"]["total_return_pct"] == 8.0
+    assert payload["data"]["drawdown_pct"] == 1.85
+
+
+@patch("dashboard._load_main_dashboard_data")
+def test_actions_endpoint_returns_service_unavailable_on_db_error(mock_loader, dashboard_client):
+    mock_loader.return_value = (
+        {
+            "summary": {},
+            "positions": [],
+            "orders": [],
+            "actions": [],
+            "recent_trades": [],
+            "equity_snapshots": [],
+        },
+        "db unavailable",
+    )
+
+    response = dashboard_client.get("/api/actions")
+    payload = response.get_json()
+
+    assert response.status_code == 503
+    assert payload["ok"] is False
+    assert "db unavailable" in payload["error"]
+
+
+@patch("dashboard._load_main_dashboard_data")
+def test_recent_events_endpoint_aliases_actions(mock_loader, dashboard_client):
+    mock_loader.return_value = (_sample_main_payload(), None)
+
+    response = dashboard_client.get("/api/recent-events")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["data"][0]["action_type"] == "buy_filled"
+
+
+@patch("dashboard.load_arbitrage_trades")
+@patch("dashboard._load_main_dashboard_data")
+def test_dashboard_state_endpoint_returns_combined_payload(mock_loader, mock_arb, dashboard_client):
+    mock_loader.return_value = (_sample_main_payload(), None)
+    mock_arb.return_value = [
+        {
+            "opened_at": "2026-05-04T18:05:00+00:00",
+            "title": "Arb example",
+            "buy_platform": "Polymarket",
+            "sell_platform": "Kalshi",
+            "buy_price": 0.48,
+            "sell_price": 0.51,
+            "spread_percent": 0.03,
+            "realized_pnl": 1.25,
+        }
+    ]
+
+    response = dashboard_client.get("/api/dashboard-state")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["data"]["summary"]["requested_mode"] == "paper"
+    assert payload["data"]["positions"][0]["position_id"] == "pos-1"
+    assert payload["data"]["arbitrage_trades"][0]["title"] == "Arb example"
+
+
+@patch("dashboard._load_main_dashboard_data")
+def test_dashboard_state_endpoint_keeps_200_on_db_error(mock_loader, dashboard_client):
+    mock_loader.return_value = (
+        {
+            "summary": {},
+            "positions": [],
+            "orders": [],
+            "actions": [],
+            "recent_trades": [],
+            "equity_snapshots": [],
+        },
+        "db unavailable",
+    )
+
+    response = dashboard_client.get("/api/dashboard-state")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["ok"] is False
+    assert payload["data"]["db_error"] == "db unavailable"
+
+
+@patch("dashboard.get_logs")
+def test_log_stream_bootstrap_current_skips_existing_lines(mock_logs, dashboard_client):
+    mock_logs.return_value = ["line 1", "line 2", "line 3"]
+
+    response = dashboard_client.get("/api/log-stream?bootstrap=current")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["data"]["lines"] == []
+    assert payload["data"]["next_offset"] == 3
+    assert payload["data"]["reset"] is False
+
+
+@patch("dashboard.get_logs")
+def test_log_stream_returns_incremental_lines(mock_logs, dashboard_client):
+    mock_logs.return_value = ["line 1", "line 2", "line 3"]
+
+    response = dashboard_client.get("/api/log-stream?offset=1")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["data"]["lines"] == ["line 2", "line 3"]
+    assert payload["data"]["next_offset"] == 3
+    assert payload["data"]["reset"] is False
+
+
+@patch("dashboard.get_logs")
+@patch("dashboard.load_arbitrage_trades")
+@patch("dashboard._load_main_dashboard_data")
+def test_index_renders_main_strategy_sections(mock_loader, mock_arb, mock_logs, dashboard_client):
+    mock_loader.return_value = (_sample_main_payload(), None)
+    mock_arb.return_value = []
+    mock_logs.return_value = ["example log line"]
+
+    response = dashboard_client.get("/")
+    html = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert "Musashi Main Strategy" in html
+    assert "Open Positions" in html
+    assert "Action Timeline" in html
+    assert "Arbitrage Sidecar" in html
+    assert "Total PnL" in html
+    assert "Drawdown" in html

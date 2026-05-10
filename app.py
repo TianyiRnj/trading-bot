@@ -64,6 +64,6 @@ _try_start_bot()
 
 if __name__ == "__main__":
     HOST = os.getenv("HOST", "127.0.0.1")
-    PORT = int(os.getenv("PORT", "5000"))
+    PORT = int(os.getenv("PORT", "5001"))
     DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     app.run(host=HOST, port=PORT, debug=DEBUG)

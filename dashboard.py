@@ -322,6 +322,6 @@ def api_log_stream():
 
 if __name__ == "__main__":
     _HOST = os.getenv("HOST", "127.0.0.1")
-    _PORT = int(os.getenv("PORT", "5000"))
+    _PORT = int(os.getenv("PORT", "5001"))
     _DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     app.run(host=_HOST, port=_PORT, debug=_DEBUG)
