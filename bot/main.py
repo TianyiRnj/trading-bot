@@ -969,7 +969,7 @@ def _resolve_effective_mode_and_trader(
 
 class Bot:
     def __init__(self, *, install_signal_handlers: bool = True) -> None:
-        self.requested_mode = REQUESTED_MODE
+        self.requested_mode = "paper"
         self.musashi = MusashiClient(BASE_URL)
         self.polymarket_public = PolymarketPublicClient()
         self.geolocation = GeolocationClient()
@@ -980,31 +980,76 @@ class Bot:
         self.mode_run_id: int | None = None
         self.protection_mode_reason: str | None = None
         self.pending_fallback_reason: str | None = None
+        self.positions = {}
+        self.pending_orders = {}
+        self.seen_event_ids = set()
+        self.account_state = {"bankroll": BANKROLL_USD, "mode": "paper"}
 
         self.effective_mode, self.fallback_reason, self.trader = (
-            _resolve_effective_mode_and_trader(REQUESTED_MODE, self.polymarket_public)
+            _resolve_effective_mode_and_trader("paper", self.polymarket_public)
         )
 
-        try:
-            init_pool(
-                min_size=POSTGRES_POOL_MIN,
-                max_size=POSTGRES_POOL_MAX,
-                timeout=POSTGRES_CONNECT_TIMEOUT_SECONDS,
+        if self.effective_mode != "paper":
+            try:
+                init_pool(
+                    min_size=POSTGRES_POOL_MIN,
+                    max_size=POSTGRES_POOL_MAX,
+                    timeout=POSTGRES_CONNECT_TIMEOUT_SECONDS,
+                )
+            except RuntimeError as exc:
+                logger.critical("Cannot init DB pool: %s", exc)
+                raise SystemExit(1) from exc
+
+            ok, error = check_db_available()
+            if not ok:
+                logger.critical("Database not available: %s", error)
+                raise SystemExit(1)
+            ok, error = check_db_schema_ready()
+            if not ok:
+                logger.critical("Database schema not ready: %s", error)
+                raise SystemExit(1)
+
+            if self.effective_mode == "paper":
+                try:
+                    with get_db() as conn:
+                        if repo.has_live_exposure(conn):
+                            logger.critical(
+                                "Cannot start with effective paper mode while live exposure exists in DB. "
+                                "Reconcile manually before restarting. requested_mode=%s fallback_reason=%s",
+                                self.requested_mode,
+                                self.fallback_reason,
+                            )
+                            raise SystemExit(1)
+                except SystemExit:
+                    raise
+                except Exception as exc:
+                    logger.critical("Failed to verify live exposure before startup: %s", exc)
+                    raise SystemExit(1) from exc
+        if self.requested_mode == "live" and self.effective_mode == "paper":
+            logger.warning(
+                "Degrading from live to paper mode. fallback_reason=%s",
+                self.fallback_reason,
             )
-        except RuntimeError as exc:
-            logger.critical("Cannot init DB pool: %s", exc)
-            raise SystemExit(1) from exc
 
-        ok, error = check_db_available()
-        if not ok:
-            logger.critical("Database not available: %s", error)
-            raise SystemExit(1)
-        ok, error = check_db_schema_ready()
-        if not ok:
-            logger.critical("Database schema not ready: %s", error)
-            raise SystemExit(1)
+        run_label = os.getenv("BOT_RUN_LABEL", "default")
+        if self.effective_mode != "paper":
+            try:
+                with get_db() as conn:
+                    self.mode_run_id = repo.insert_mode_run(
+                        conn, run_label, self.requested_mode, self.effective_mode, self.fallback_reason
+                    )
+                    repo.upsert_account_state(
+                        conn,
+                        account_key=ACCOUNT_KEY,
+                        initial_bankroll=BANKROLL_USD,
+                        requested_mode=self.requested_mode,
+                        effective_mode=self.effective_mode,
+                    )
+            except Exception as exc:
+                logger.critical("DB setup writes failed (mode_run / account_state): %s", exc)
+                raise SystemExit(1) from exc
 
-        if self.effective_mode == "paper":
+        if self.effective_mode != "paper":
             try:
                 with get_db() as conn:
                     if repo.has_live_exposure(conn):
@@ -1020,50 +1065,17 @@ class Bot:
             except Exception as exc:
                 logger.critical("Failed to verify live exposure before startup: %s", exc)
                 raise SystemExit(1) from exc
-        if self.requested_mode == "live" and self.effective_mode == "paper":
-            logger.warning(
-                "Degrading from live to paper mode. fallback_reason=%s",
-                self.fallback_reason,
+            if not self.account_state:
+                logger.critical("account_state is missing after DB initialization")
+                raise SystemExit(1)
+            logger.info(
+                "Bot requested_mode=%s effective_mode=%s fallback_reason=%s "
+                "positions=%d pending_orders=%d seen_events=%d",
+                self.requested_mode, self.effective_mode, self.fallback_reason,
+                len(self.positions), len(self.pending_orders), len(self.seen_event_ids),
             )
 
-        run_label = os.getenv("BOT_RUN_LABEL", "default")
-        try:
-            with get_db() as conn:
-                self.mode_run_id = repo.insert_mode_run(
-                    conn, run_label, self.requested_mode, self.effective_mode, self.fallback_reason
-                )
-                repo.upsert_account_state(
-                    conn,
-                    account_key=ACCOUNT_KEY,
-                    initial_bankroll=BANKROLL_USD,
-                    requested_mode=self.requested_mode,
-                    effective_mode=self.effective_mode,
-                )
-        except Exception as exc:
-            logger.critical("DB setup writes failed (mode_run / account_state): %s", exc)
-            raise SystemExit(1) from exc
-
-        try:
-            with get_db() as conn:
-                self.positions = repo.load_open_positions(conn, effective_mode=self.effective_mode)
-                self.pending_orders = repo.load_pending_orders(conn, effective_mode=self.effective_mode)
-                self.seen_event_ids = repo.load_seen_events(conn)
-                self.account_state = repo.get_account_state(conn, ACCOUNT_KEY) or {}
-        except Exception as exc:
-            logger.critical("Failed to load state from DB: %s", exc)
-            raise SystemExit(1) from exc
-
-        if not self.account_state:
-            logger.critical("account_state is missing after DB initialization")
-            raise SystemExit(1)
-
-        logger.info(
-            "Bot requested_mode=%s effective_mode=%s fallback_reason=%s "
-            "positions=%d pending_orders=%d seen_events=%d",
-            self.requested_mode, self.effective_mode, self.fallback_reason,
-            len(self.positions), len(self.pending_orders), len(self.seen_event_ids),
-        )
-
+        
         self.market_stream = PolymarketMarketStream(enabled=POLYMARKET_WS_ENABLED)
         self.user_stream = (
             PolymarketUserStream(self.trader.ws_auth_payload(), enabled=POLYMARKET_WS_ENABLED)
@@ -1132,26 +1144,27 @@ class Bot:
 
     def persist_runtime_state(self, reason: str = "runtime") -> None:
         self.sync_realtime_subscriptions()
-        try:
-            with get_db() as conn:
-                for position in self.positions.values():
-                    repo.upsert_position(
-                        conn,
-                        position,
-                        requested_mode=self.requested_mode,
-                        effective_mode=self.effective_mode,
-                    )
-                for pending_order in self.pending_orders.values():
-                    repo.upsert_pending_order(
-                        conn,
-                        pending_order,
-                        requested_mode=self.requested_mode,
-                        effective_mode=self.effective_mode,
-                    )
-                if self.mode_run_id is not None:
-                    repo.update_mode_heartbeat(conn, self.mode_run_id)
-        except Exception as exc:
-            logger.warning("Runtime flush failed (%s): %s", reason, exc)
+        if self.effective_mode != "paper":
+            try:
+                with get_db() as conn:
+                    for position in self.positions.values():
+                        repo.upsert_position(
+                            conn,
+                            position,
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                        )
+                    for pending_order in self.pending_orders.values():
+                        repo.upsert_pending_order(
+                            conn,
+                            pending_order,
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                        )
+                    if self.mode_run_id is not None:
+                        repo.update_mode_heartbeat(conn, self.mode_run_id)
+            except Exception as exc:
+                logger.warning("Runtime flush failed (%s): %s", reason, exc)
 
     def sync_account_market_state(
         self,
@@ -1183,28 +1196,29 @@ class Bot:
                 total_unrealized += as_float(position.get("unrealized_pnl_usd"))
 
         self.positions = updated_positions
+        if self.effective_mode != "paper":
+            
+            try:
+                with get_db() as conn:
+                    if persist_positions:
+                        for position in self.positions.values():
+                            repo.upsert_position(
+                                conn,
+                                position,
+                                requested_mode=self.requested_mode,
+                                effective_mode=self.effective_mode,
+                            )
+                    repo.update_account_market_state(
+                        conn,
+                        ACCOUNT_KEY,
+                        positions_value=round(total_value, 6),
+                        unrealized_pnl=round(total_unrealized, 6),
+                    )
+                self.refresh_account_state_from_db()
+            except Exception as exc:
+                logger.warning("Account mark-to-market sync failed: %s", exc)
 
-        try:
-            with get_db() as conn:
-                if persist_positions:
-                    for position in self.positions.values():
-                        repo.upsert_position(
-                            conn,
-                            position,
-                            requested_mode=self.requested_mode,
-                            effective_mode=self.effective_mode,
-                        )
-                repo.update_account_market_state(
-                    conn,
-                    ACCOUNT_KEY,
-                    positions_value=round(total_value, 6),
-                    unrealized_pnl=round(total_unrealized, 6),
-                )
-            self.refresh_account_state_from_db()
-        except Exception as exc:
-            logger.warning("Account mark-to-market sync failed: %s", exc)
-
-        return self.account_state
+            return self.account_state
 
     def has_live_exposure(self) -> bool:
         try:
@@ -1217,6 +1231,7 @@ class Bot:
     def activate_paper_mode(self, reason: str, context: str) -> None:
         if self.effective_mode == "paper":
             return
+        
         self.effective_mode = "paper"
         self.fallback_reason = f"{context}:{reason}"[:500]
         self.pending_fallback_reason = None
@@ -1226,22 +1241,22 @@ class Bot:
             self.user_stream.stop()
         self.user_stream = None
         if self.mode_run_id is not None:
-            try:
-                with get_db() as conn:
-                    repo.update_mode_run_state(
-                        conn,
-                        self.mode_run_id,
-                        effective_mode=self.effective_mode,
-                        fallback_reason=self.fallback_reason,
-                    )
-                    repo.update_account_modes(
-                        conn,
-                        ACCOUNT_KEY,
-                        requested_mode=self.requested_mode,
-                        effective_mode=self.effective_mode,
-                    )
-            except Exception as exc:
-                logger.warning("Failed to persist paper fallback: %s", exc)
+                try:
+                    with get_db() as conn:
+                        repo.update_mode_run_state(
+                            conn,
+                            self.mode_run_id,
+                            effective_mode=self.effective_mode,
+                            fallback_reason=self.fallback_reason,
+                        )
+                        repo.update_account_modes(
+                            conn,
+                            ACCOUNT_KEY,
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                        )
+                except Exception as exc:
+                    logger.warning("Failed to persist paper fallback: %s", exc)
         self.refresh_account_state_from_db()
         self.save_state()
         logger.warning(
@@ -1495,6 +1510,13 @@ class Bot:
 
     def should_trade(self, signal_payload: dict[str, Any]) -> Decision | None:
         if not signal_payload.get("success"):
+            for match in matches:
+                market = match.get("market", {})
+                print(f"MARKET: platform={market.get('platform')} volume={market.get('volume24h')} prob={current_probability(market, action['direction'])}")
+                if market.get("platform") != "polymarket":
+                    continue
+                ...
+
             return None
 
         action = signal_payload.get("data", {}).get("suggested_action")
@@ -1559,12 +1581,13 @@ class Bot:
         return round(max(0.0, min(size, remaining)), 2)
 
     def record_seen(self, event_id: str) -> None:
-        self.seen_event_ids.add(event_id)
-        try:
-            with get_db() as conn:
-                repo.insert_seen_event(conn, event_id)
-        except Exception as exc:
-            logger.warning("Failed to persist seen event %s: %s", event_id, exc)
+        if self.effective_mode != "paper":
+            self.seen_event_ids.add(event_id)
+            try:
+                with get_db() as conn:
+                    repo.insert_seen_event(conn, event_id)
+            except Exception as exc:
+                logger.warning("Failed to persist seen event %s: %s", event_id, exc)
 
     def apply_exit_fill_to_position(
         self,
@@ -1908,6 +1931,7 @@ class Bot:
             return False
         try:
             signal = self.musashi.analyze_text(title, min_confidence=0.5, max_results=3)
+
         except Exception as exc:
             logger.warning("Failed to analyze reversal for %s: %s", position.get("market_id"), exc)
             return False
@@ -3072,7 +3096,8 @@ class Bot:
         self.sync_account_market_state(refresh_prices=bool(self.positions))
 
     def handle_feed_item(self, item: dict[str, Any]) -> None:
-        event_id = item.get("event_id")
+
+        event_id = item.get("event_id") or item.get("analyzed_at")
         if not event_id or event_id in self.seen_event_ids:
             return
 
@@ -3083,6 +3108,7 @@ class Bot:
             return
 
         signal = self.musashi.analyze_text(tweet_text, min_confidence=0.5, max_results=3)
+
         decision = self.should_trade(signal)
         if not decision:
             # No actionable signal — permanently consume the event.
@@ -3093,6 +3119,9 @@ class Bot:
         # liquidity gap does not permanently suppress a valid signal.
         if self.execute_trade(decision):
             self.record_seen(str(event_id))
+            
+        signal = self.musashi.analyze_text(tweet_text, min_confidence=0.5, max_results=3)
+
 
     def _handle_sigterm(self, signum: int, frame: Any) -> None:
         logger.info("SIGTERM received — initiating clean shutdown")
