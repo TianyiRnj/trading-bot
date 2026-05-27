@@ -41,7 +41,7 @@ SCAN_INTERVAL_SECONDS = int(os.getenv("BOT_SCAN_INTERVAL_SECONDS", "60"))
 MIN_CONFIDENCE = float(os.getenv("BOT_MIN_CONFIDENCE", "0.76"))
 MIN_EDGE = float(os.getenv("BOT_MIN_EDGE", "0.05"))
 MIN_VOLUME_24H = float(os.getenv("BOT_MIN_VOLUME_24H", "20000"))
-MIN_PRICE = float(os.getenv("BOT_MIN_PRICE", "0.08"))
+MIN_PRICE = float(os.getenv("BOT_MIN_PRICE", "0.05"))
 MAX_PRICE = float(os.getenv("BOT_MAX_PRICE", "0.85"))
 BANKROLL_USD = float(os.getenv("BOT_BANKROLL_USD", "10"))
 MAX_POSITION_USD = float(os.getenv("BOT_MAX_POSITION_USD", "3"))
@@ -474,13 +474,21 @@ class MusashiClient:
         return payload.get("data", {}).get("tweets", [])
 
     def analyze_text(self, text: str, min_confidence: float = 0.5, max_results: int = 3) -> dict[str, Any]:
-        response = self.session.post(
+        for attempt in range(3):
+            response = self.session.post(
             f"{self.base_url}/api/analyze-text",
             json={"text": text, "minConfidence": min_confidence, "maxResults": max_results},
             timeout=self.timeout,
-        )
+            )
+            if response.status_code != 503:
+                break
+            print(f"DEBUG analyze-text 503, retrying ({attempt+1}/3)...")
+            time.sleep(2 ** attempt)
         response.raise_for_status()
         return response.json()
+
+    
+    
 
     def get_arbitrage(self, min_spread: float = 0.05, limit: int = 20) -> dict[str, Any]:
         """Get arbitrage opportunities between Polymarket and Kalshi"""
@@ -716,6 +724,8 @@ def parse_order_status(response: dict[str, Any], fallback_price: float) -> Order
 
 
 class PaperTrader:
+    
+    
     def place_market_buy(self, token_id: str, amount_usd: float, meta: dict[str, Any]) -> dict[str, Any]:
         probability = clamp_price(as_float(meta.get("probability"), 0.5))
         shares = estimate_shares(amount_usd, probability)
@@ -1007,6 +1017,12 @@ class Bot:
         self.effective_mode, self.fallback_reason, self.trader = (
             _resolve_effective_mode_and_trader("paper", self.polymarket_public)
         )
+        
+        #restarting the market, remembering trades
+        _paper_seen_path = "bot/data/seen_events_paper.json"
+        if self.effective_mode == "paper" and os.path.exists(_paper_seen_path):
+            with open(_paper_seen_path) as f:
+                self.seen_event_ids = set(json.load(f))
 
         if self.effective_mode != "paper":
             try:
@@ -1542,7 +1558,6 @@ class Bot:
         if not signal_payload.get("success"):
             for match in matches:
                 market = match.get("market", {})
-                print(f"MARKET: platform={market.get('platform')} volume={market.get('volume24h')} prob={current_probability(market, action['direction'])}")
                 if market.get("platform") != "polymarket":
                     continue
                 ...
@@ -1554,8 +1569,10 @@ class Bot:
         urgency = signal_payload.get("urgency")
         event_id = signal_payload.get("event_id")
 
-        if not action or not matches or not event_id:
+        if not action or not matches:
             return None
+        
+
         if urgency not in {"medium", "high", "critical"}:
             return None
         if action.get("direction") not in {"YES", "NO"}:
@@ -1603,6 +1620,7 @@ class Bot:
             score = base_score * score_multiplier
             ranked_markets.append((score, market, infra_context))
 
+
         if not ranked_markets:
             return None
 
@@ -1639,6 +1657,10 @@ class Bot:
     def record_seen(self, event_id: str) -> None:
         if self.effective_mode != "paper":
             self.seen_event_ids.add(event_id)
+            if self.effective_mode == "paper":
+                with open("bot/data/seen_events_paper.json", "w") as f:
+                    json.dump(list(self.seen_event_ids), f)
+
             try:
                 with get_db() as conn:
                     repo.insert_seen_event(conn, event_id)
@@ -1968,6 +1990,7 @@ class Bot:
     def should_exit_position(self, position: dict[str, Any], market: dict[str, Any]) -> tuple[str | None, float]:
         current_prob = self.current_position_probability(position, market)
         entry_prob = float(position.get("entry_probability", 0))
+        print(f"DEBUG exit check: entry={entry_prob} current={current_prob} tp_threshold={entry_prob * (1 + TAKE_PROFIT_PCT)}")
         if entry_prob <= 0:
             return "invalid_entry_probability", current_prob
 
@@ -1988,7 +2011,7 @@ class Bot:
         if not title:
             return False
         try:
-            signal = self.musashi.analyze_text(title, min_confidence=0.5, max_results=3)
+            signal = self.musashi.analyze_text(title, min_confidence=0.3, max_results=3)
 
         except Exception as exc:
             logger.warning("Failed to analyze reversal for %s: %s", position.get("market_id"), exc)
@@ -3154,10 +3177,11 @@ class Bot:
         self.sync_account_market_state(refresh_prices=bool(self.positions))
 
     def handle_feed_item(self, item: dict[str, Any]) -> None:
-
         event_id = item.get("event_id") or item.get("analyzed_at")
         if not event_id or event_id in self.seen_event_ids:
             return
+        
+
 
         tweet = item.get("tweet", {})
         tweet_text = tweet.get("text", "")
@@ -3165,7 +3189,11 @@ class Bot:
             self.record_seen(str(event_id))
             return
 
-        signal = self.musashi.analyze_text(tweet_text, min_confidence=0.5, max_results=3)
+        try:
+            signal = self.musashi.analyze_text(tweet_text, min_confidence=0.3, max_results=3)
+        except Exception as e:
+            print(f"DEBUG analyze-text failed: {e}")
+            return
 
         decision = self.should_trade(signal)
         if not decision:
@@ -3177,8 +3205,14 @@ class Bot:
         # liquidity gap does not permanently suppress a valid signal.
         if self.execute_trade(decision):
             self.record_seen(str(event_id))
-            
-        signal = self.musashi.analyze_text(tweet_text, min_confidence=0.5, max_results=3)
+        
+        
+        try:
+            signal = self.musashi.analyze_text(tweet_text, min_confidence=0.3, max_results=3)
+        except Exception as e:
+            print(f"DEBUG analyze-text failed: {e}")
+            return
+
 
 
     def _handle_sigterm(self, signum: int, frame: Any) -> None:
@@ -3203,6 +3237,7 @@ class Bot:
             logger.warning("Failed to close DB pool: %s", exc)
 
     def run(self) -> None:
+        
         shutdown_reason = "normal"
         try:
             try:
@@ -3247,6 +3282,7 @@ class Bot:
                     self.monitor_positions()
                     self.evaluate_live_protection_transition()
                     feed = self.musashi.get_feed(limit=20, min_urgency="medium")
+                    print(f"\n{'='*50} LOOP START {'='*50}")
                     logger.info("Fetched %d feed items", len(feed))
                     for item in feed:
                         self.handle_feed_item(item)
