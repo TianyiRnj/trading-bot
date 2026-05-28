@@ -42,6 +42,17 @@ class ArbitrageOpportunity:
     profit_usd: float
     poly_volume: float
     kalshi_volume: float
+    
+class SumArbitrageOpportunity:
+    """Represents a YES+NO mispricing on a single Polymarket market."""
+    market_id: str
+    title: str
+    yes_price: float
+    no_price: float
+    total: float
+    gap: float          # 1.0 - total (how much free money per share)
+    profit_usd: float   # estimated profit at POSITION_SIZE_USD
+    volume_24h: float
 
 
 def _parse_opportunity(
@@ -347,6 +358,108 @@ class ArbitrageStrategy:
 
         except Exception as exc:
             logger.exception("Failed to execute arbitrage: %s", exc)
+            
+    def find_sum_arbitrage_opportunities(self) -> list[SumArbitrageOpportunity]:
+        try:
+            response = self.musashi.get_markets(platform="polymarket", limit=100)
+            if not response or not response.get("success"):
+                return []
+
+            markets = response.get("data", {}).get("markets", [])
+            opportunities = []
+
+            for market in markets:
+                try:
+                    outcome_prices = market.get("outcomePrices")
+                    if not outcome_prices:
+                        continue
+
+                    # outcomePrices is either a list ["0.6", "0.4"] or a JSON string
+                    if isinstance(outcome_prices, str):
+                        import json as _json
+                        outcome_prices = _json.loads(outcome_prices)
+
+                    if len(outcome_prices) != 2:
+                        continue
+
+                    yes_price = float(outcome_prices[0])
+                    no_price = float(outcome_prices[1])
+                    total = yes_price + no_price
+
+                    # Only flag if sum is meaningfully below 1.0
+                    if total >= 0.95:
+                        continue
+
+                    volume = float(market.get("volume24h") or 0)
+                    if volume < MIN_VOLUME_USD:
+                        continue
+
+                    gap = 1.0 - total
+                    shares = POSITION_SIZE_USD / yes_price
+                    profit = gap * shares
+
+                    opportunities.append(SumArbitrageOpportunity(
+                        market_id=str(market.get("id", "")),
+                        title=str(market.get("title", "Unknown")),
+                        yes_price=yes_price,
+                        no_price=no_price,
+                        total=total,
+                        gap=gap,
+                        profit_usd=profit,
+                        volume_24h=volume,
+                    ))
+                except Exception as exc:
+                    logger.debug("Error parsing market for sum arb: %s", exc)
+
+            opportunities.sort(key=lambda x: x.gap, reverse=True)
+            return opportunities
+
+        except Exception as exc:
+            logger.error("Failed to find sum arbitrage: %s", exc)
+            return []
+
+    def execute_sum_arbitrage(self, opportunity: SumArbitrageOpportunity) -> None:
+        """Log and record a YES+NO sum arbitrage simulation."""
+        try:
+            logger.info("=" * 70)
+            logger.info("YES+NO SUM ARBITRAGE (simulation)")
+            logger.info("Market: %s", opportunity.title[:60])
+            logger.info("YES:    %.1f¢", opportunity.yes_price * 100)
+            logger.info("NO:     %.1f¢", opportunity.no_price * 100)
+            logger.info("Total:  %.1f¢ (gap: %.1f¢)", opportunity.total * 100, opportunity.gap * 100)
+            logger.info("Simulated profit: $%.2f", opportunity.profit_usd)
+            logger.info("=" * 70)
+
+            trade_record = {
+                "opened_at": utc_now_iso(),
+                "strategy": "sum_arbitrage_simulation",
+                "market_id": opportunity.market_id,
+                "title": opportunity.title,
+                "yes_price": opportunity.yes_price,
+                "no_price": opportunity.no_price,
+                "total": opportunity.total,
+                "gap": opportunity.gap,
+                "position_size_usd": POSITION_SIZE_USD,
+                "profit_usd": opportunity.profit_usd,
+                "volume_24h": opportunity.volume_24h,
+            }
+
+            _ARB_TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with _ARB_TRADES_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(trade_record) + "\n")
+
+            self.total_profit += opportunity.profit_usd
+            self.arb_count += 1
+
+            logger.info(
+                "Simulated sum arb profit: $%.2f | Session total: $%.2f (%d trades)",
+                opportunity.profit_usd,
+                self.total_profit,
+                self.arb_count,
+            )
+
+        except Exception as exc:
+            logger.exception("Failed to execute sum arbitrage: %s", exc)
 
     def run_scanner(self) -> None:
         """Continuous loop: scan for opportunities, log and record the best one."""
@@ -367,9 +480,19 @@ class ArbitrageStrategy:
                     self.execute_arbitrage(opportunities[0])
                 else:
                     logger.debug("No arbitrage opportunities found this scan")
+                # Yes+no sum arbitrage (only polymarket, no Kalshi needed)
+                sum_opportunities = self.find_sum_arbitrage_opportunities()
+                if sum_opportunities:
+                    logger.info("Found %d YES+NO sum opportunity/ies", len(sum_opportunities))
+                    self.execute_sum_arbitrage(sum_opportunities[0])
+                else:
+                    logger.debug("No YES+NO sum arbitrage opportunities found")
 
                 self._stop_event.wait(self.scan_interval)
 
             except Exception as exc:
                 logger.exception("Arbitrage scanner error: %s", exc)
                 self._stop_event.wait(10)
+        
+
+
