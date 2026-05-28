@@ -4,6 +4,7 @@ import os
 import signal
 import threading
 import time
+from turtle import position
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1655,18 +1656,20 @@ class Bot:
         return round(max(0.0, min(size, remaining)), 2)
 
     def record_seen(self, event_id: str) -> None:
-        if self.effective_mode != "paper":
-            self.seen_event_ids.add(event_id)
-            if self.effective_mode == "paper":
+        self.seen_event_ids.add(event_id)
+        if self.effective_mode == "paper":
+            try:
                 with open("bot/data/seen_events_paper.json", "w") as f:
                     json.dump(list(self.seen_event_ids), f)
-
+            except Exception as exc:
+                logger.warning("Failed to persist seen event %s: %s", event_id, exc)
+        else:
             try:
                 with get_db() as conn:
                     repo.insert_seen_event(conn, event_id)
             except Exception as exc:
                 logger.warning("Failed to persist seen event %s: %s", event_id, exc)
-
+                
     def apply_exit_fill_to_position(
         self,
         market_id: str,
@@ -2438,6 +2441,20 @@ class Bot:
         else:
             self.positions[market_id] = updated_position
         self.sync_account_market_state(refresh_prices=False)
+        
+        if self.effective_mode == "paper" and updated_position is None:
+            event_id = position.get("event_id")
+            print(f"DEBUG close: event_id={event_id}")
+            if event_id:
+                self.seen_event_ids.add(event_id)
+            self.seen_event_ids.add(market_id)  # fallback by market_id
+            try:
+                with open("bot/data/seen_events_paper.json", "w") as f:
+                    json.dump(list(self.seen_event_ids), f)
+            except Exception as exc:
+                logger.warning("Failed to persist seen_event_ids: %s", exc)
+
+
 
     def monitor_positions(self) -> None:
         if self.positions:
@@ -3205,13 +3222,6 @@ class Bot:
         # liquidity gap does not permanently suppress a valid signal.
         if self.execute_trade(decision):
             self.record_seen(str(event_id))
-        
-        
-        try:
-            signal = self.musashi.analyze_text(tweet_text, min_confidence=0.3, max_results=3)
-        except Exception as e:
-            print(f"DEBUG analyze-text failed: {e}")
-            return
 
 
 
