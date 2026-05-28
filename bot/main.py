@@ -55,7 +55,7 @@ EXIT_ON_SIGNAL_REVERSAL = os.getenv("BOT_EXIT_ON_SIGNAL_REVERSAL", "true").lower
 EXIT_ORDER_TIMEOUT_SECONDS = int(os.getenv("BOT_EXIT_ORDER_TIMEOUT_SECONDS", "120"))
 EXIT_ORDER_REPRICE = os.getenv("BOT_EXIT_ORDER_REPRICE", "true").lower() == "true"
 STARTUP_RECONCILE = os.getenv("BOT_STARTUP_RECONCILE", "true").lower() == "true"
-BOT_ENABLE_ARBITRAGE = os.getenv("BOT_ENABLE_ARBITRAGE", "false").lower() == "true"
+BOT_ENABLE_ARBITRAGE = os.getenv("BOT_ENABLE_ARBITRAGE", "true").lower() == "true"
 BOT_ARB_SCAN_INTERVAL_SECONDS = max(1, int(os.getenv("BOT_ARB_SCAN_INTERVAL_SECONDS", "30")))
 POLYMARKET_WS_ENABLED = os.getenv("POLYMARKET_WS_ENABLED", "true").lower() == "true"
 RESTRICTED_COUNTRIES = {
@@ -487,9 +487,6 @@ class MusashiClient:
             time.sleep(2 ** attempt)
         response.raise_for_status()
         return response.json()
-
-    
-    
 
     def get_arbitrage(self, min_spread: float = 0.05, limit: int = 20) -> dict[str, Any]:
         """Get arbitrage opportunities between Polymarket and Kalshi"""
