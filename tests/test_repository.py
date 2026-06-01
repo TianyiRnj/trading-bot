@@ -53,4 +53,34 @@ def test_upsert_order_preserves_executed_value_when_omitted():
 
     sql, params = conn.calls[0]
     assert "executed_value_usd = COALESCE(%s, orders.executed_value_usd)" in sql
-    assert params[-2] is None
+    # The final positional arg corresponds to the ON CONFLICT executed_value_usd
+    # COALESCE placeholder; passing None preserves the existing DB value.
+    assert params[-1] is None
+
+
+def test_upsert_order_passes_metadata_jsonb_and_executed_value_in_correct_slots():
+    # Regression for an args-tuple ordering bug where the metadata JSONB and the
+    # ON CONFLICT executed_value_usd numeric were swapped, causing every order
+    # write to fail with "column metadata is of type jsonb but expression is of
+    # type double precision" (and aborting the whole transaction with it).
+    from psycopg.types.json import Jsonb
+
+    conn = _RecordingConn()
+
+    repository.upsert_order(
+        conn,
+        order_id="order-1",
+        side="BUY",
+        execution_mode="direct_execution",
+        status="filled",
+        requested_mode="paper",
+        effective_mode="paper",
+        executed_value_usd=12.34,
+        metadata={"signal_type": "tweet", "urgency": "high"},
+    )
+
+    _, params = conn.calls[0]
+    # Second-to-last arg fills the INSERT VALUES metadata (jsonb) column.
+    assert isinstance(params[-2], Jsonb)
+    # Last arg fills the ON CONFLICT executed_value_usd COALESCE placeholder.
+    assert params[-1] == 12.34

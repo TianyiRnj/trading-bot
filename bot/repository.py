@@ -691,8 +691,8 @@ def upsert_order(
             fallback_reason,
             created_at,
             status,
-            executed_value_usd,
             Jsonb(metadata or {}),
+            executed_value_usd,
         ),
     )
 

@@ -980,7 +980,7 @@ def _resolve_effective_mode_and_trader(
 
 class Bot:
     def __init__(self, *, install_signal_handlers: bool = True) -> None:
-        self.requested_mode = REQUESTED_MODE
+        self.requested_mode = "paper"
         self.musashi = MusashiClient(BASE_URL)
         self.polymarket_public = PolymarketPublicClient()
         self.geolocation = GeolocationClient()
@@ -999,9 +999,13 @@ class Bot:
         self.mode_run_id: int | None = None
         self.protection_mode_reason: str | None = None
         self.pending_fallback_reason: str | None = None
+        self.positions = {}
+        self.pending_orders = {}
+        self.seen_event_ids = set()
+        self.account_state = {"bankroll": BANKROLL_USD, "mode": "paper"}
 
         self.effective_mode, self.fallback_reason, self.trader = (
-            _resolve_effective_mode_and_trader(REQUESTED_MODE, self.polymarket_public)
+            _resolve_effective_mode_and_trader("paper", self.polymarket_public)
         )
 
         try:
@@ -1024,6 +1028,8 @@ class Bot:
             raise SystemExit(1)
 
         if self.effective_mode == "paper":
+            # Paper mode must refuse to start when real live exposure exists in DB,
+            # so the paper trader cannot fabricate fills against live state.
             try:
                 with get_db() as conn:
                     if repo.has_live_exposure(conn):
@@ -1039,20 +1045,12 @@ class Bot:
             except Exception as exc:
                 logger.critical("Failed to verify live exposure before startup: %s", exc)
                 raise SystemExit(1) from exc
+
         if self.requested_mode == "live" and self.effective_mode == "paper":
             logger.warning(
                 "Degrading from live to paper mode. fallback_reason=%s",
                 self.fallback_reason,
             )
-        if self.market_intelligence.market_intelligence_enabled():
-            logger.info("musashi-infra market intelligence enabled via Supabase")
-        if BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK and BOT_ENABLE_ARBITRAGE and not self.market_intelligence.is_configured():
-            logger.warning(
-                "BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK=true but musashi-infra Supabase credentials are missing; "
-                "continuing without arbitrage fallback"
-            )
-        elif self.market_intelligence.arbitrage_fallback_enabled() and BOT_ENABLE_ARBITRAGE:
-            logger.info("musashi-infra arbitrage fallback enabled via Supabase")
 
         run_label = os.getenv("BOT_RUN_LABEL", "default")
         try:
@@ -1071,19 +1069,16 @@ class Bot:
             logger.critical("DB setup writes failed (mode_run / account_state): %s", exc)
             raise SystemExit(1) from exc
 
-        try:
-            with get_db() as conn:
-                self.positions = repo.load_open_positions(conn, effective_mode=self.effective_mode)
-                self.pending_orders = repo.load_pending_orders(conn, effective_mode=self.effective_mode)
-                self.seen_event_ids = repo.load_seen_events(conn)
-                self.account_state = repo.get_account_state(conn, ACCOUNT_KEY) or {}
-        except Exception as exc:
-            logger.critical("Failed to load state from DB: %s", exc)
-            raise SystemExit(1) from exc
-
+        self.refresh_account_state_from_db()
         if not self.account_state:
             logger.critical("account_state is missing after DB initialization")
             raise SystemExit(1)
+
+        try:
+            with get_db() as conn:
+                self.seen_event_ids = repo.load_seen_events(conn)
+        except Exception as exc:
+            logger.warning("Failed to load seen events from DB: %s", exc)
 
         logger.info(
             "Bot requested_mode=%s effective_mode=%s fallback_reason=%s "
@@ -1091,7 +1086,17 @@ class Bot:
             self.requested_mode, self.effective_mode, self.fallback_reason,
             len(self.positions), len(self.pending_orders), len(self.seen_event_ids),
         )
+        if self.market_intelligence.market_intelligence_enabled():
+            logger.info("musashi-infra market intelligence enabled via Supabase")
+        if BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK and BOT_ENABLE_ARBITRAGE and not self.market_intelligence.is_configured():
+            logger.warning(
+                "BOT_ENABLE_INFRA_ARBITRAGE_FALLBACK=true but musashi-infra Supabase credentials are missing; "
+                "continuing without arbitrage fallback"
+            )
+        elif self.market_intelligence.arbitrage_fallback_enabled() and BOT_ENABLE_ARBITRAGE:
+            logger.info("musashi-infra arbitrage fallback enabled via Supabase")
 
+        
         self.market_stream = PolymarketMarketStream(enabled=POLYMARKET_WS_ENABLED)
         self.user_stream = (
             PolymarketUserStream(self.trader.ws_auth_payload(), enabled=POLYMARKET_WS_ENABLED)
@@ -1162,26 +1167,27 @@ class Bot:
 
     def persist_runtime_state(self, reason: str = "runtime") -> None:
         self.sync_realtime_subscriptions()
-        try:
-            with get_db() as conn:
-                for position in self.positions.values():
-                    repo.upsert_position(
-                        conn,
-                        position,
-                        requested_mode=self.requested_mode,
-                        effective_mode=self.effective_mode,
-                    )
-                for pending_order in self.pending_orders.values():
-                    repo.upsert_pending_order(
-                        conn,
-                        pending_order,
-                        requested_mode=self.requested_mode,
-                        effective_mode=self.effective_mode,
-                    )
-                if self.mode_run_id is not None:
-                    repo.update_mode_heartbeat(conn, self.mode_run_id)
-        except Exception as exc:
-            logger.warning("Runtime flush failed (%s): %s", reason, exc)
+        if self.effective_mode != "paper":
+            try:
+                with get_db() as conn:
+                    for position in self.positions.values():
+                        repo.upsert_position(
+                            conn,
+                            position,
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                        )
+                    for pending_order in self.pending_orders.values():
+                        repo.upsert_pending_order(
+                            conn,
+                            pending_order,
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                        )
+                    if self.mode_run_id is not None:
+                        repo.update_mode_heartbeat(conn, self.mode_run_id)
+            except Exception as exc:
+                logger.warning("Runtime flush failed (%s): %s", reason, exc)
 
     def sync_account_market_state(
         self,
@@ -1213,7 +1219,6 @@ class Bot:
                 total_unrealized += as_float(position.get("unrealized_pnl_usd"))
 
         self.positions = updated_positions
-
         try:
             with get_db() as conn:
                 if persist_positions:
@@ -1247,6 +1252,7 @@ class Bot:
     def activate_paper_mode(self, reason: str, context: str) -> None:
         if self.effective_mode == "paper":
             return
+        
         self.effective_mode = "paper"
         self.fallback_reason = f"{context}:{reason}"[:500]
         self.pending_fallback_reason = None
@@ -1256,22 +1262,22 @@ class Bot:
             self.user_stream.stop()
         self.user_stream = None
         if self.mode_run_id is not None:
-            try:
-                with get_db() as conn:
-                    repo.update_mode_run_state(
-                        conn,
-                        self.mode_run_id,
-                        effective_mode=self.effective_mode,
-                        fallback_reason=self.fallback_reason,
-                    )
-                    repo.update_account_modes(
-                        conn,
-                        ACCOUNT_KEY,
-                        requested_mode=self.requested_mode,
-                        effective_mode=self.effective_mode,
-                    )
-            except Exception as exc:
-                logger.warning("Failed to persist paper fallback: %s", exc)
+                try:
+                    with get_db() as conn:
+                        repo.update_mode_run_state(
+                            conn,
+                            self.mode_run_id,
+                            effective_mode=self.effective_mode,
+                            fallback_reason=self.fallback_reason,
+                        )
+                        repo.update_account_modes(
+                            conn,
+                            ACCOUNT_KEY,
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                        )
+                except Exception as exc:
+                    logger.warning("Failed to persist paper fallback: %s", exc)
         self.refresh_account_state_from_db()
         self.save_state()
         logger.warning(
@@ -1851,6 +1857,14 @@ class Bot:
 
         try:
             with get_db() as conn:
+                # Position must be inserted before the order — orders.position_id is a
+                # foreign key into positions(position_id), so the reverse order trips
+                # the FK constraint and aborts the entire transaction.
+                repo.upsert_position(
+                    conn, position,
+                    requested_mode=self.requested_mode,
+                    effective_mode=self.effective_mode,
+                )
                 repo.upsert_order(
                     conn,
                     order_id=order_id,
@@ -1874,11 +1888,6 @@ class Bot:
                     remaining_shares=max(requested_shares - fill.filled_shares, 0.0),
                     fallback_reason=decision.reason,
                     metadata={"response": fill.raw_response, "signal_type": decision.signal_type, "urgency": decision.urgency},
-                )
-                repo.upsert_position(
-                    conn, position,
-                    requested_mode=self.requested_mode,
-                    effective_mode=self.effective_mode,
                 )
                 repo.insert_trade_event(
                     conn,
@@ -1966,6 +1975,7 @@ class Bot:
             return False
         try:
             signal = self.musashi.analyze_text(title, min_confidence=0.5, max_results=3)
+
         except Exception as exc:
             logger.warning("Failed to analyze reversal for %s: %s", position.get("market_id"), exc)
             return False
@@ -3130,7 +3140,8 @@ class Bot:
         self.sync_account_market_state(refresh_prices=bool(self.positions))
 
     def handle_feed_item(self, item: dict[str, Any]) -> None:
-        event_id = item.get("event_id")
+
+        event_id = item.get("event_id") or item.get("analyzed_at")
         if not event_id or event_id in self.seen_event_ids:
             return
 
@@ -3141,6 +3152,7 @@ class Bot:
             return
 
         signal = self.musashi.analyze_text(tweet_text, min_confidence=0.5, max_results=3)
+
         decision = self.should_trade(signal)
         if not decision:
             # No actionable signal — permanently consume the event.
@@ -3151,6 +3163,9 @@ class Bot:
         # liquidity gap does not permanently suppress a valid signal.
         if self.execute_trade(decision):
             self.record_seen(str(event_id))
+            
+        signal = self.musashi.analyze_text(tweet_text, min_confidence=0.5, max_results=3)
+
 
     def _handle_sigterm(self, signum: int, frame: Any) -> None:
         logger.info("SIGTERM received — initiating clean shutdown")
