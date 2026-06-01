@@ -55,7 +55,7 @@ EXIT_ON_SIGNAL_REVERSAL = os.getenv("BOT_EXIT_ON_SIGNAL_REVERSAL", "true").lower
 EXIT_ORDER_TIMEOUT_SECONDS = int(os.getenv("BOT_EXIT_ORDER_TIMEOUT_SECONDS", "120"))
 EXIT_ORDER_REPRICE = os.getenv("BOT_EXIT_ORDER_REPRICE", "true").lower() == "true"
 STARTUP_RECONCILE = os.getenv("BOT_STARTUP_RECONCILE", "true").lower() == "true"
-BOT_ENABLE_ARBITRAGE = os.getenv("BOT_ENABLE_ARBITRAGE", "true").lower() == "true"
+BOT_ENABLE_ARBITRAGE = os.getenv("BOT_ENABLE_ARBITRAGE", "false").lower() == "false"
 BOT_ARB_SCAN_INTERVAL_SECONDS = max(1, int(os.getenv("BOT_ARB_SCAN_INTERVAL_SECONDS", "30")))
 POLYMARKET_WS_ENABLED = os.getenv("POLYMARKET_WS_ENABLED", "true").lower() == "true"
 RESTRICTED_COUNTRIES = {
@@ -1597,7 +1597,25 @@ class Bot:
             if float(market.get("volume24h", 0)) < MIN_VOLUME_24H:
                 continue
             if probability <= MIN_PRICE or probability >= MAX_PRICE:
+                print(f"DEBUG price filter: live={probability:.3f} — outside min/max")
                 continue
+            if probability > 0.40:
+                print(f"DEBUG high-prob skip: live={probability:.3f} — market likely already resolved")
+                continue
+            try:
+                live_market = self.gamma.resolve_market(market)
+                live_outcome_prices = live_market.get("outcomePrices")
+                if isinstance(live_outcome_prices, str):
+                    import json as _json
+                    live_outcome_prices = _json.loads(live_outcome_prices)
+                if live_outcome_prices and len(live_outcome_prices) == 2:
+                    live_prob = float(live_outcome_prices[0]) if action["direction"] == "YES" else float(live_outcome_prices[1])
+                    if live_prob > 0.40:
+                        print(f"DEBUG live gamma check: live={live_prob:.3f} — skipping stale match")
+                        continue
+            except Exception as exc:
+                print(f"DEBUG gamma check failed: {exc}")
+            
             base_score = (
                 float(action["confidence"])
                 * float(action["edge"])
@@ -3209,6 +3227,7 @@ class Bot:
             print(f"DEBUG analyze-text failed: {e}")
             return
 
+
         decision = self.should_trade(signal)
         if not decision:
             # No actionable signal — permanently consume the event.
@@ -3219,7 +3238,14 @@ class Bot:
         # liquidity gap does not permanently suppress a valid signal.
         if self.execute_trade(decision):
             self.record_seen(str(event_id))
-
+            
+        logger.info("TRADE SIGNAL: tweet=%s action=%s confidence=%s edge=%s market=%s",
+            tweet_text[:80],
+            signal.get("data", {}).get("suggested_action", {}).get("direction"),
+            signal.get("data", {}).get("suggested_action", {}).get("confidence"),
+            signal.get("data", {}).get("suggested_action", {}).get("edge"),
+            decision.market.get("title") if decision else "none"
+        )
 
 
     def _handle_sigterm(self, signum: int, frame: Any) -> None:
