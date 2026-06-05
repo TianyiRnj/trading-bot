@@ -465,14 +465,33 @@ class MusashiClient:
         return response.json()
 
     def get_feed(self, limit: int = 20, min_urgency: str = "high") -> list[dict[str, Any]]:
-        response = self.session.get(
-            f"{self.base_url}/api/feed",
-            params={"limit": limit, "minUrgency": min_urgency},
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return payload.get("data", {}).get("tweets", [])
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = self.session.get(
+                    f"{self.base_url}/api/feed",
+                    params={"limit": limit, "minUrgency": min_urgency},
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                return payload.get("data", {}).get("tweets", [])
+            except requests_exceptions.ConnectionError as exc:
+                last_exc = exc
+                logger.warning(
+                    "Feed connection error (attempt %d/3): %s — retrying in %ds",
+                    attempt + 1, exc, 2 ** attempt,
+                )
+                time.sleep(2 ** attempt)
+            except requests_exceptions.ChunkedEncodingError as exc:
+                last_exc = exc
+                logger.warning(
+                    "Feed chunked encoding error (attempt %d/3): %s — retrying in %ds",
+                    attempt + 1, exc, 2 ** attempt,
+                )
+                time.sleep(2 ** attempt)
+        logger.error("Feed fetch failed after 3 attempts: %s", last_exc)
+        return []
 
     def analyze_text(self, text: str, min_confidence: float = 0.5, max_results: int = 3) -> dict[str, Any]:
         for attempt in range(3):
@@ -1386,6 +1405,8 @@ class Bot:
 
     def assert_runtime_safety(self, context: str, *, log_checks: bool = False) -> None:
         if self.effective_mode == "paper" and not PAPER_GEO_STRICT:
+            return
+        if self.effective_mode != "paper" and not PAPER_GEO_STRICT:
             try:
                 location = self.geolocation.locate()
                 if location:
@@ -1395,6 +1416,7 @@ class Bot:
             except SafetyShutdown as exc:
                 logger.warning("[paper] safety advisory (non-fatal): %s", exc)
             return
+            
 
         location = self.geolocation.locate()
         if not location:
