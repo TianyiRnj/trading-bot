@@ -87,6 +87,7 @@ POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 POLYMARKET_SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))
 POLYMARKET_FUNDER = os.getenv("POLYMARKET_FUNDER", "")
 
+AUDIT_LOG_PATH = Path("bot/data/trade_audit.jsonl")
 LOG_DIR = Path("bot/logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -133,6 +134,15 @@ def extract_condition_id(payload: dict[str, Any]) -> str | None:
         if value not in (None, ""):
             return str(value)
     return None
+
+def write_audit(record: dict[str, Any]) -> None:
+    try:
+        AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG_PATH, "a") as f:
+            f.write(json.dumps({**record, "written_at": utc_now_iso()}) + "\n")
+    except Exception as exc:
+        logger.warning("Failed to write audit record: %s", exc)
+
 
 
 class GeolocationClient:
@@ -636,6 +646,7 @@ class Decision:
     probability: float
     score: float
     infra_context: dict[str, Any] | None = None
+    tweet_text: str | None = None
 
 
 @dataclass
@@ -1574,7 +1585,7 @@ class Bot:
             self.trader.ws_auth_payload()
         self.assert_runtime_safety("startup", log_checks=True)
 
-    def should_trade(self, signal_payload: dict[str, Any]) -> Decision | None:
+    def should_trade(self, signal_payload: dict[str, Any], tweet_text: str | None = None) -> Decision | None:
         if not signal_payload.get("success"):
             for match in matches:
                 market = match.get("market", {})
@@ -1617,13 +1628,25 @@ class Bot:
                 continue
             probability = current_probability(market, action["direction"])
             if float(market.get("volume24h", 0)) < MIN_VOLUME_24H:
+                logger.info(
+                    "REJECT market=%s — volume24h $%.0f below minimum $%.0f",
+                    market.get("title"), float(market.get("volume24h", 0)), MIN_VOLUME_24H,
+                )
                 continue
+
             if probability <= MIN_PRICE or probability >= MAX_PRICE:
-                print(f"DEBUG price filter: live={probability:.3f} — outside min/max")
+                logger.info(
+                    "REJECT market=%s — price %.3f outside bounds [%.2f, %.2f]",
+                    market.get("title"), probability, MIN_PRICE, MAX_PRICE,
+                )
                 continue
             if probability > 0.40:
-                print(f"DEBUG high-prob skip: live={probability:.3f} — market likely already resolved")
+                logger.info(
+                    "REJECT market=%s — snapshot prob %.3f too high, likely stale or resolved",
+                    market.get("title"), probability,
+                )
                 continue
+
             try:
                 live_market = self.gamma.resolve_market(market)
                 live_outcome_prices = live_market.get("outcomePrices")
@@ -1633,11 +1656,13 @@ class Bot:
                 if live_outcome_prices and len(live_outcome_prices) == 2:
                     live_prob = float(live_outcome_prices[0]) if action["direction"] == "YES" else float(live_outcome_prices[1])
                     if live_prob > 0.40:
-                        print(f"DEBUG live gamma check: live={live_prob:.3f} — skipping stale match")
+                        logger.info(
+                            "REJECT market=%s — live gamma prob %.3f too high, skipping stale match",
+                            market.get("title"), live_prob,
+                        )
                         continue
             except Exception as exc:
-                print(f"DEBUG gamma check failed: {exc}")
-            
+                logger.warning("Gamma price check failed for market=%s: %s", market.get("title"), exc)
             base_score = (
                 float(action["confidence"])
                 * float(action["edge"])
@@ -1676,6 +1701,7 @@ class Bot:
             probability=current_probability(best_market, str(action["direction"])),
             score=score,
             infra_context=best_infra_context,
+            tweet_text=tweet_text,
         )
 
     def size_position(self, decision: Decision) -> float:
@@ -1933,6 +1959,28 @@ class Bot:
             position["infra_context"] = decision.infra_context
         self.positions[market_id] = position
         self.save_state()
+        
+        #Audit log - paper mode only
+        if self.effective_mode == "paper":
+            write_audit({
+                "event_type": "entry",
+                "market_id": market_id,
+                "market_title": market["title"],
+                "market_url": market.get("url"),
+                "side": decision.side,
+                "entry_price": fill.avg_price,
+                "size_usd": fill.filled_value_usd,
+                "shares": fill.filled_shares,
+                "confidence": decision.confidence,
+                "edge": decision.edge,
+                "urgency": decision.urgency,
+                "score": decision.score,
+                "signal_type": decision.signal_type,
+                "tweet_text": getattr(decision, "tweet_text", None),
+                "opened_at": position["opened_at"],
+                "position_id": position["position_id"],
+            })
+
 
         try:
             with get_db() as conn:
@@ -2490,6 +2538,54 @@ class Bot:
                     json.dump(list(self.seen_event_ids), f)
             except Exception as exc:
                 logger.warning("Failed to persist seen_event_ids: %s", exc)
+            
+            # Audit log — full exit record with PnL
+            entry_price = float(position.get("entry_probability", 0))
+            shares = float(closed.get("sold_shares", 0))
+            proceeds = round(shares * fill.avg_price, 4)
+            cost = round(shares * entry_price, 4)
+            pnl_usd = round(proceeds - cost, 4)
+            return_pct = round((pnl_usd / cost * 100), 2) if cost > 0 else 0.0
+            opened_at = position.get("opened_at")
+            hold_minutes = 0.0
+            if opened_at:
+                try:
+                    hold_minutes = round(
+                        (datetime.now(timezone.utc) - parse_iso_datetime(str(opened_at))).total_seconds() / 60,
+                        1,
+                    )
+                except Exception:
+                    pass
+            write_audit({
+                "event_type": "exit",
+                "position_id": position.get("position_id"),
+                "market_id": market_id,
+                "market_title": position.get("title"),
+                "side": position.get("side"),
+                "entry_price": entry_price,
+                "exit_price": fill.avg_price,
+                "shares": shares,
+                "cost_usd": cost,
+                "proceeds_usd": proceeds,
+                "pnl_usd": pnl_usd,
+                "return_pct": return_pct,
+                "exit_reason": exit_reason,
+                "hold_minutes": hold_minutes,
+                "opened_at": opened_at,
+                "closed_at": utc_now_iso(),
+                "tweet_text": position.get("tweet_text"),
+            })
+            logger.info(
+                "TRADE CLOSED: market=%s exit_reason=%s entry=%.3f exit=%.3f pnl=$%.4f return=%.1f%% hold=%.1fmin",
+                position.get("title"),
+                exit_reason,
+                entry_price,
+                fill.avg_price,
+                pnl_usd,
+                return_pct,
+                hold_minutes,
+            )
+
 
 
 
@@ -3234,8 +3330,6 @@ class Bot:
         event_id = item.get("event_id") or item.get("analyzed_at")
         if not event_id or event_id in self.seen_event_ids:
             return
-        
-
 
         tweet = item.get("tweet", {})
         tweet_text = tweet.get("text", "")
@@ -3246,28 +3340,42 @@ class Bot:
         try:
             signal = self.musashi.analyze_text(tweet_text, min_confidence=0.3, max_results=3)
         except Exception as e:
-            print(f"DEBUG analyze-text failed: {e}")
+            logger.warning("analyze-text failed for event %s: %s", event_id, exc)
             return
-
-
-        decision = self.should_trade(signal)
+        
+        action = signal.get("data", {}).get("suggested_action", {}) or {}
+        logger.info(
+            "SIGNAL: tweet=%r direction=%s confidence=%s edge=%s urgency=%s",
+            tweet_text[:80],
+            action.get("direction"),
+            action.get("confidence"),
+            action.get("edge"),
+            signal.get("urgency"),
+        )
+        
+        decision = self.should_trade(signal, tweet_text=tweet_text)
         if not decision:
+            logger.info("SIGNAL NO TRADE: event=%s — no actionable decision from should_trade", event_id)
             # No actionable signal — permanently consume the event.
             self.record_seen(str(event_id))
             return
+            
+        logger.info(
+            "TRADE DECISION: market=%s side=%s confidence=%.3f edge=%.3f score=%.4f prob=%.3f size=$%.2f",
+            decision.market.get("title"),
+            decision.side,
+            decision.confidence,
+            decision.edge,
+            decision.score,
+            decision.probability,
+            self.size_position(decision),
+        )
+        
         # execute_trade returns False for transient skips (e.g. empty order book).
         # Only mark the event seen for terminal outcomes so that a temporary
         # liquidity gap does not permanently suppress a valid signal.
         if self.execute_trade(decision):
             self.record_seen(str(event_id))
-            
-        logger.info("TRADE SIGNAL: tweet=%s action=%s confidence=%s edge=%s market=%s",
-            tweet_text[:80],
-            signal.get("data", {}).get("suggested_action", {}).get("direction"),
-            signal.get("data", {}).get("suggested_action", {}).get("confidence"),
-            signal.get("data", {}).get("suggested_action", {}).get("edge"),
-            decision.market.get("title") if decision else "none"
-        )
 
 
     def _handle_sigterm(self, signum: int, frame: Any) -> None:
