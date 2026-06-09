@@ -30,6 +30,7 @@ claude.md
 
 # Local documents
 *.pdf
+package-lock.json
 
 # OS files
 .DS_Store

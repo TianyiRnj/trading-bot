@@ -4,7 +4,6 @@ import os
 import signal
 import threading
 import time
-from turtle import position
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -55,7 +54,7 @@ EXIT_ON_SIGNAL_REVERSAL = os.getenv("BOT_EXIT_ON_SIGNAL_REVERSAL", "true").lower
 EXIT_ORDER_TIMEOUT_SECONDS = int(os.getenv("BOT_EXIT_ORDER_TIMEOUT_SECONDS", "120"))
 EXIT_ORDER_REPRICE = os.getenv("BOT_EXIT_ORDER_REPRICE", "true").lower() == "true"
 STARTUP_RECONCILE = os.getenv("BOT_STARTUP_RECONCILE", "true").lower() == "true"
-BOT_ENABLE_ARBITRAGE = os.getenv("BOT_ENABLE_ARBITRAGE", "false").lower() == "false"
+BOT_ENABLE_ARBITRAGE = os.getenv("BOT_ENABLE_ARBITRAGE", "false").lower() == "true"
 BOT_ARB_SCAN_INTERVAL_SECONDS = max(1, int(os.getenv("BOT_ARB_SCAN_INTERVAL_SECONDS", "30")))
 POLYMARKET_WS_ENABLED = os.getenv("POLYMARKET_WS_ENABLED", "true").lower() == "true"
 RESTRICTED_COUNTRIES = {
@@ -512,7 +511,7 @@ class MusashiClient:
             )
             if response.status_code != 503:
                 break
-            print(f"DEBUG analyze-text 503, retrying ({attempt+1}/3)...")
+            logger.debug("analyze-text 503, retrying (%d/3)...", attempt + 1)
             time.sleep(2 ** attempt)
         response.raise_for_status()
         return response.json()
@@ -1018,7 +1017,7 @@ def _resolve_effective_mode_and_trader(
 
 class Bot:
     def __init__(self, *, install_signal_handlers: bool = True) -> None:
-        self.requested_mode = "paper"
+        self.requested_mode = REQUESTED_MODE
         self.musashi = MusashiClient(BASE_URL)
         self.polymarket_public = PolymarketPublicClient()
         self.geolocation = GeolocationClient()
@@ -1043,7 +1042,7 @@ class Bot:
         self.account_state = {"bankroll": BANKROLL_USD, "mode": "paper"}
 
         self.effective_mode, self.fallback_reason, self.trader = (
-            _resolve_effective_mode_and_trader("paper", self.polymarket_public)
+            _resolve_effective_mode_and_trader(REQUESTED_MODE, self.polymarket_public)
         )
         
         #restarting the market, remembering trades
@@ -1270,29 +1269,30 @@ class Bot:
                 total_unrealized += as_float(position.get("unrealized_pnl_usd"))
 
         self.positions = updated_positions
-        if self.effective_mode != "paper":
-            
-            try:
-                with get_db() as conn:
-                    if persist_positions:
-                        for position in self.positions.values():
-                            repo.upsert_position(
-                                conn,
-                                position,
-                                requested_mode=self.requested_mode,
-                                effective_mode=self.effective_mode,
-                            )
-                    repo.update_account_market_state(
-                        conn,
-                        ACCOUNT_KEY,
-                        positions_value=round(total_value, 6),
-                        unrealized_pnl=round(total_unrealized, 6),
-                    )
-                self.refresh_account_state_from_db()
-            except Exception as exc:
-                logger.warning("Account mark-to-market sync failed: %s", exc)
+        
+        try:
+            with get_db() as conn:
+                if persist_positions:
+                    for position in self.positions.values():
+                        repo.upsert_position(
+                            conn,
+                            position,
+                            requested_mode=self.requested_mode,
+                            effective_mode=self.effective_mode,
+                        )
+                repo.update_account_market_state(
+                    conn,
+                    ACCOUNT_KEY,
+                    positions_value=round(total_value, 6),
+                    unrealized_pnl=round(total_unrealized, 6),
+                )
+            self.refresh_account_state_from_db()
+        except Exception as exc:
+            logger.warning("Account mark-to-market sync failed: %s", exc)
 
-            return self.account_state
+        return self.account_state
+            
+            
 
     def has_live_exposure(self) -> bool:
         try:
@@ -1415,20 +1415,10 @@ class Bot:
         return profile
 
     def assert_runtime_safety(self, context: str, *, log_checks: bool = False) -> None:
+        # Paper mode with strict off: no real money at risk, skip geo entirely
         if self.effective_mode == "paper" and not PAPER_GEO_STRICT:
             return
-        if self.effective_mode != "paper" and not PAPER_GEO_STRICT:
-            try:
-                location = self.geolocation.locate()
-                if location:
-                    if log_checks:
-                        self._log_geo("Paper mode geolocation (advisory):", location)
-                    self._assert_location_profile_allowed(location, context)
-            except SafetyShutdown as exc:
-                logger.warning("[paper] safety advisory (non-fatal): %s", exc)
-            return
             
-
         location = self.geolocation.locate()
         if not location:
             raise SafetyShutdown(f"{context}: geolocation unavailable; refusing to continue")
@@ -1587,13 +1577,8 @@ class Bot:
 
     def should_trade(self, signal_payload: dict[str, Any], tweet_text: str | None = None) -> Decision | None:
         if not signal_payload.get("success"):
-            for match in matches:
-                market = match.get("market", {})
-                if market.get("platform") != "polymarket":
-                    continue
-                ...
-
             return None
+
 
         action = signal_payload.get("data", {}).get("suggested_action")
         matches = signal_payload.get("data", {}).get("markets", [])
@@ -2078,7 +2063,8 @@ class Bot:
     def should_exit_position(self, position: dict[str, Any], market: dict[str, Any]) -> tuple[str | None, float]:
         current_prob = self.current_position_probability(position, market)
         entry_prob = float(position.get("entry_probability", 0))
-        print(f"DEBUG exit check: entry={entry_prob} current={current_prob} tp_threshold={entry_prob * (1 + TAKE_PROFIT_PCT)}")
+        logger.debug("exit check: entry=%.4f current=%.4f tp_threshold=%.4f",
+                     entry_prob, current_prob, entry_prob * (1 + TAKE_PROFIT_PCT),)
         if entry_prob <= 0:
             return "invalid_entry_probability", current_prob
 
