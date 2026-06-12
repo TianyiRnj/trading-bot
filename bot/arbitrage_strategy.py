@@ -24,6 +24,18 @@ logger = logging.getLogger("arbitrage")
 MIN_SPREAD_PERCENT = 0.05   # 5% minimum spread to log an opportunity
 POSITION_SIZE_USD = 10.0    # $10 per leg (total $20 simulated exposure)
 MIN_VOLUME_USD = 0        # $500 minimum 24h volume — Kalshi political markets often report $0 24h volume
+MIN_CONFIDENCE = 0.7        # below this the keyword match is too weak to trust
+MIN_KALSHI_VOLUME = 0       # set to >0 once Kalshi volume data is reliable
+MIN_TITLE_OVERLAP = 2  # meaningful words that must appear in both titles
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "in", "at", "to", "for",
+    "is", "will", "be", "by", "on", "with", "as", "that", "this",
+    "from", "are", "was", "were", "have", "has", "had", "not", "no",
+    "world", "cup", "finals", "game", "match", "market", "resolve",
+    "resolved", "win", "wins", "winner", "2026", "2025", "2024",
+    "yes", "no", "other", "exact", "outcome", "series", "men", "mens",
+}
+
 
 _ARB_TRADES_FILE = Path(__file__).parent / "data" / "arbitrage_trades.jsonl"
 
@@ -42,6 +54,40 @@ class ArbitrageOpportunity:
     profit_usd: float
     poly_volume: float
     kalshi_volume: float
+    
+# Words that are too generic to count as meaningful overlap between titles.
+# Matching on "world" and "cup" alone does not mean it's the same event.
+def _titles_are_similar(title_a: str, title_b: str) -> bool:
+    """Return True if the two market titles share enough meaningful words.
+
+    Strips stopwords and generic prediction market terms before comparing,
+    so 'Will X win the 2026 FIFA World Cup?' and 'Will Y perform at the
+    2026 FIFA World Cup Opening Ceremony?' don't match just because they
+    both contain 'world', 'cup', and '2026'.
+
+    Requires at least MIN_TITLE_OVERLAP meaningful words in common.
+    The subject of the market (the named entity or event) must be shared,
+    not just the tournament/competition context.
+    """
+    def meaningful_words(title: str) -> set[str]:
+        words = title.lower().split()
+        cleaned = set()
+        for word in words:
+            # strip punctuation
+            word = word.strip("?.,!()\"'")
+            if word and word not in _STOPWORDS and len(word) > 2:
+                cleaned.add(word)
+        return cleaned
+
+    words_a = meaningful_words(title_a)
+    words_b = meaningful_words(title_b)
+
+    if not words_a or not words_b:
+        return False
+
+    overlap = words_a & words_b
+    return len(overlap) >= MIN_TITLE_OVERLAP
+
     
 def _parse_opportunity(
     arb: dict,
@@ -66,6 +112,28 @@ def _parse_opportunity(
     if not poly_id or not kalshi_id or poly_price == 0 or kalshi_price == 0:
         return None
 
+    confidence = float(arb.get("confidence", 0))
+    if confidence < MIN_CONFIDENCE:
+        logger.debug(
+            "REJECT arb: confidence %.2f below threshold %.2f — poly=%s kalshi=%s",
+            confidence, MIN_CONFIDENCE,
+            poly_market.get("title", "")[:40],
+            kalshi_market.get("title", "")[:40],
+        )
+        return None
+
+    # Reject if title similarity is too low
+    if not _titles_are_similar(
+        poly_market.get("title", ""),
+        kalshi_market.get("title", ""),
+    ):
+        logger.debug(
+            "REJECT arb: titles not similar enough — poly=%r kalshi=%r",
+            poly_market.get("title", "")[:40],
+            kalshi_market.get("title", "")[:40],
+        )
+        return None
+
     spread = abs(poly_price - kalshi_price)
     spread_pct = spread / min(poly_price, kalshi_price)
     
@@ -77,6 +145,14 @@ def _parse_opportunity(
     kalshi_volume = float(kalshi_market.get("volume24h", 0))
     if poly_volume < min_volume or kalshi_volume < min_volume:
         return None
+    
+    # Kalshi volume filter — separate threshold since Kalshi often reports $0
+    # even on active markets. Keep at 0 for now but log when it's zero.
+    if kalshi_volume == 0:
+        logger.debug(
+            "ARB NOTE: Kalshi volume is $0 for %s — treating as illiquid",
+            kalshi_market.get("title", "")[:40],
+        )
 
     buy_platform = "polymarket" if poly_price < kalshi_price else "kalshi"
     sell_platform = "kalshi" if buy_platform == "polymarket" else "polymarket"
